@@ -6216,13 +6216,15 @@ def handle_post(handler, parsed) -> bool:
             _record_login_attempt(client_ip)
             return bad(handler, "Invalid password", 401)
         cookie_val = create_session()
+        body = json.dumps({"ok": True}).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
         handler.send_header("Cache-Control", "no-store")
         _security_headers(handler)
         set_auth_cookie(handler, cookie_val)
         handler.end_headers()
-        handler.wfile.write(json.dumps({"ok": True}).encode())
+        handler.wfile.write(body)
         return True
 
     if parsed.path == "/api/auth/logout":
@@ -6231,13 +6233,15 @@ def handle_post(handler, parsed) -> bool:
         cookie_val = parse_cookie(handler)
         if cookie_val:
             invalidate_session(cookie_val)
+        body = json.dumps({"ok": True}).encode()
         handler.send_response(200)
         handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
         handler.send_header("Cache-Control", "no-store")
         _security_headers(handler)
         clear_auth_cookie(handler)
         handler.end_headers()
-        handler.wfile.write(json.dumps({"ok": True}).encode())
+        handler.wfile.write(body)
         return True
 
     # ── Checkpoints / Rollback (POST) ──
@@ -6577,7 +6581,7 @@ def _handle_sse_stream(handler, parsed):
         handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
         handler.send_header("Cache-Control", "no-cache")
         handler.send_header("X-Accel-Buffering", "no")
-        handler.send_header("Connection", "keep-alive")
+        handler.send_header("Connection", "close")
         handler.end_headers()
         try:
             _replay_run_journal(handler, stream_id, _parse_run_journal_after_seq(qs))
@@ -6589,7 +6593,7 @@ def _handle_sse_stream(handler, parsed):
     handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
-    handler.send_header("Connection", "keep-alive")
+    handler.send_header("Connection", "close")
     handler.end_headers()
     try:
         while True:
@@ -6720,7 +6724,7 @@ def _handle_terminal_output(handler, parsed):
     handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
-    handler.send_header("Connection", "keep-alive")
+    handler.send_header("Connection", "close")
     handler.end_headers()
     try:
         while True:
@@ -6798,7 +6802,7 @@ def _handle_gateway_sse_stream(handler, parsed):
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
-    handler.send_header('Connection', 'keep-alive')
+    handler.send_header('Connection', 'close')
     handler.end_headers()
 
     q = watcher.subscribe()
@@ -6831,7 +6835,7 @@ def _handle_session_events_stream(handler):
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
-    handler.send_header('Connection', 'keep-alive')
+    handler.send_header('Connection', 'close')
     handler.end_headers()
 
     q = subscribe_session_events()
@@ -6917,6 +6921,7 @@ def _serve_file_bytes(handler, target: Path, mime: str, disposition: str, cache_
         handler.send_response(416)
         handler.send_header("Content-Range", f"bytes */{file_size}")
         handler.send_header("Accept-Ranges", "bytes")
+        handler.send_header("Content-Length", "0")
         _security_headers(handler)
         handler.end_headers()
         return True
@@ -7027,10 +7032,12 @@ def _handle_media(handler, parsed):
     if is_auth_enabled():
         cv = parse_cookie(handler)
         if not (cv and verify_session(cv)):
+            body = b'{"error":"Authentication required"}'
             handler.send_response(401)
             handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(body)))
             handler.end_headers()
-            handler.wfile.write(b'{"error":"Authentication required"}')
+            handler.wfile.write(body)
             return
 
     qs = parse_qs(parsed.query)
@@ -7389,7 +7396,7 @@ def _handle_approval_sse_stream(handler, parsed):
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
-    handler.send_header('Connection', 'keep-alive')
+    handler.send_header('Connection', 'close')
     handler.end_headers()
 
     from api.streaming import _sse
@@ -7490,7 +7497,7 @@ def _handle_clarify_sse_stream(handler, parsed):
     handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
     handler.send_header('Cache-Control', 'no-cache')
     handler.send_header('X-Accel-Buffering', 'no')
-    handler.send_header('Connection', 'keep-alive')
+    handler.send_header('Connection', 'close')
     handler.end_headers()
 
     from api.streaming import _sse
