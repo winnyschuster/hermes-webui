@@ -507,7 +507,7 @@ function _openImgLightbox(imgEl) {
   // opens a single-image lightbox (no navigation between staged uploads).
   let allImages = [];
   let startIndex = 0;
-  if(!imgEl.closest('.attach-tray, #composerAttach')){
+  if(!imgEl.closest('.attach-tray')){
     let container = imgEl.closest('.msg-row, .assistant-turn-blocks, .assistant-turn, .user-turn');
     if(!container) container = imgEl.parentElement;
     if(container){
