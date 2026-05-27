@@ -5492,6 +5492,13 @@ def _run_agent_streaming(
                         mark_turn_completed(s.session_id, agent=agent)
                     except Exception:
                         logger.debug("Memory lifecycle mark failed for session %s", s.session_id, exc_info=True)
+            # ── Skill usage counter (non-blocking, best-effort) ──
+            try:
+                from api.skill_usage import increment_skill_usage
+                from api.routes import _active_skills_dir
+                increment_skill_usage(_active_skills_dir(), s.tool_calls or [])
+            except Exception:
+                logger.debug("Skill usage counter update failed", exc_info=True)
             # Sync to state.db for /insights (opt-in setting)
             try:
                 from api.config import load_settings as _load_settings
