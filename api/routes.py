@@ -8108,9 +8108,13 @@ def _handle_media(handler, parsed):
         "google_token.json", "google_client_secret.json",
         "gateway_state.json", "channel_directory.json", "jobs.json",
     }
-    # Internal state subdirs that are sensitive in their entirety.
+    # Internal state subdirs that are sensitive in their entirety. NOTE:
+    # `profiles` is intentionally NOT here — it is a container of profile roots,
+    # each of which has its own legitimate workspace/. We instead enumerate each
+    # named-profile root below and deny ITS state subdirs, so a sibling profile's
+    # secrets are blocked without 403-ing a named-profile workspace. (#3234.)
     _DENY_SUBDIRS = (
-        "sessions", "memories", "profiles", "cron", "logs",
+        "sessions", "memories", "cron", "logs",
         "checkpoints", "backups",
     )
     _state_dir = None
@@ -8134,6 +8138,24 @@ def _handle_media(handler, parsed):
     ):
         if _r is not None and _r not in _hermes_roots:
             _hermes_roots.append(_r)
+    # Enumerate named-profile roots (<root>/profiles/<name>) and treat each as a
+    # Hermes root in its own right, so a sibling/other profile's sensitive subdirs
+    # + secret files are denied — WITHOUT denying the whole `profiles` container
+    # (which would block a legit named-profile workspace at
+    # <root>/profiles/<name>/workspace/). (Codex review #3234.)
+    _profile_roots = []
+    for _root in list(_hermes_roots):
+        _profiles_dir = (_root / "profiles")
+        try:
+            if _profiles_dir.is_dir():
+                for _pchild in _profiles_dir.iterdir():
+                    if _pchild.is_dir():
+                        _pr = _pchild.resolve()
+                        if _pr not in _hermes_roots and _pr not in _profile_roots:
+                            _profile_roots.append(_pr)
+        except OSError:
+            pass
+    _hermes_roots.extend(_profile_roots)
 
     # Case-insensitive path helpers so STATE.DB / Sessions/ casing variants
     # cannot bypass the deny on macOS/Windows filesystems (Codex review #3234).

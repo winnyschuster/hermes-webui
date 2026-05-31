@@ -404,6 +404,75 @@ class TestMediaEndpointUnit(unittest.TestCase):
                     h2.status, 403,
                     "STATE_DIR/sessions/abc.json must stay denied (internal state)")
 
+    def test_named_profile_workspace_serves_but_profile_secrets_denied(self):
+        """#3234: a named-profile workspace (<base>/profiles/p1/workspace) is
+        legitimate media and must serve, while that profile's secrets
+        (<base>/profiles/p1/auth.json) and a SIBLING profile's secrets
+        (<base>/profiles/other/auth.json) must stay denied (403).
+
+        Regression for the over-block where the whole `profiles` tree was denied.
+        """
+        from api import routes
+
+        class _Handler:
+            def __init__(self):
+                self.status = None
+                self.headers = {}
+            def send_response(self, code):
+                self.status = code
+            def send_header(self, *a, **k):
+                pass
+            def end_headers(self):
+                pass
+            class _W:
+                def write(self_inner, b):
+                    pass
+                def flush(self_inner):
+                    pass
+            wfile = _W()
+
+        png_bytes = (
+            b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
+            b'\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00'
+            b'\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+        )
+        with tempfile.TemporaryDirectory() as home:
+            base = pathlib.Path(home) / ".hermes"
+            p1_ws = base / "profiles" / "p1" / "workspace"
+            p1_ws.mkdir(parents=True)
+            (p1_ws / "shot.png").write_bytes(png_bytes)
+            p1_secret = base / "profiles" / "p1" / "auth.json"
+            p1_secret.write_text("{}", encoding="utf-8")
+            other_secret = base / "profiles" / "other" / "auth.json"
+            other_secret.parent.mkdir(parents=True)
+            other_secret.write_text("{}", encoding="utf-8")
+
+            active = base / "profiles" / "p1"  # active profile HERMES_HOME
+            with mock.patch.dict(os.environ, {"HERMES_HOME": str(active)}), \
+                 mock.patch.object(routes, "get_last_workspace", lambda: str(p1_ws)), \
+                 mock.patch("api.auth.is_auth_enabled", lambda: False), \
+                 mock.patch("api.profiles._DEFAULT_HERMES_HOME", base):
+                # named-profile workspace media → served
+                h1 = _Handler()
+                routes._handle_media(h1, SimpleNamespace(
+                    query=f"path={urllib.parse.quote(str((p1_ws / 'shot.png').resolve()))}&inline=1",
+                    path="/api/media"))
+                self.assertNotEqual(
+                    h1.status, 403,
+                    "named-profile workspace media must NOT be blocked")
+                # this profile's own secret → denied
+                h2 = _Handler()
+                routes._handle_media(h2, SimpleNamespace(
+                    query=f"path={urllib.parse.quote(str(p1_secret.resolve()))}",
+                    path="/api/media"))
+                self.assertEqual(h2.status, 403, "profile auth.json must be denied")
+                # sibling profile's secret → denied
+                h3 = _Handler()
+                routes._handle_media(h3, SimpleNamespace(
+                    query=f"path={urllib.parse.quote(str(other_secret.resolve()))}",
+                    path="/api/media"))
+                self.assertEqual(h3.status, 403, "sibling profile auth.json must be denied")
+
     def test_media_endpoints_advertise_byte_range_support(self):
         routes_src = (REPO_ROOT / "api" / "routes.py").read_text(encoding="utf-8")
         self.assertIn("Accept-Ranges", routes_src)
