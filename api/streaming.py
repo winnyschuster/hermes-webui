@@ -5868,6 +5868,12 @@ def _run_agent_streaming(
                 # block writes them to the session itself so GET /api/session
                 # returns them on reload instead of falling back to 0.
                 _cc_for_save = getattr(agent, 'context_compressor', None)
+                # Initialized before the compressor block so the #3256/#3263
+                # threshold-rescale below is safe even when there is no
+                # compressor (fresh agent / interrupted stream): _skip_cc_cl
+                # stays False and _cc_cl stays 0, so the rescale is a no-op.
+                _skip_cc_cl = False
+                _cc_cl = 0
                 if _cc_for_save:
                     _cc_cl = getattr(_cc_for_save, 'context_length', 0) or 0
                     # Same guard as routes._resolve_context_length_for_session_model:
