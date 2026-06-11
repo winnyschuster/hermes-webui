@@ -168,15 +168,84 @@ def test_active_request_env_restores_on_exception(monkeypatch, tmp_path):
 
 
 def test_providers_and_models_routes_wrap_in_profile_env():
-    """The two read routes invoke the profile-env context manager (#3957).
+    """The two read routes are profile-scoped for non-default profiles (#3957).
 
-    Structural guard: a future refactor that drops the wrapper would silently
-    reintroduce the bug, so pin the wiring at the source level.
+    Structural guard: a future refactor that drops the wiring would silently
+    reintroduce the bug, so pin it at the source level.
+      - /api/providers wraps the synchronous read in profile_env_for_active_request.
+      - /api/models relies on get_available_models() scoping its detached
+        rebuild worker via profile_scope_for_detached_worker (the request-thread
+        wrapper cannot reach the worker thread — Codex CORE finding).
     """
     routes_src = Path(profiles.__file__).resolve().parent.joinpath("routes.py").read_text(
         encoding="utf-8"
     )
-    # Both endpoint blocks must reference the active-request profile-env wrapper.
     assert "profile_env_for_active_request" in routes_src
-    # And it must be imported from the profiles module in routes.py.
-    assert routes_src.count("profile_env_for_active_request") >= 3  # 2 calls + >=1 import
+    config_src = Path(config.__file__).resolve().read_text(encoding="utf-8")
+    assert "profile_scope_for_detached_worker" in config_src
+    assert "_get_models_cache_path" in config_src
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Facet A (worker thread) — the detached models-rebuild worker is profile-scoped
+# (Codex CORE finding: the request-thread wrapper cannot reach the worker thread)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_detached_worker_scope_noop_for_default_profile(monkeypatch):
+    """profile_scope_for_detached_worker is a no-op for the default profile."""
+    monkeypatch.setattr(profiles, "_is_root_profile", lambda n: n in ("", "default"))
+    monkeypatch.delenv("ISSUE_3957_WPROBE", raising=False)
+    # Default/empty name → no TLS set, no env applied.
+    with profiles.profile_scope_for_detached_worker("default", "test"):
+        assert profiles.get_active_profile_name() in ("", "default")
+        assert os.environ.get("ISSUE_3957_WPROBE") is None
+    with profiles.profile_scope_for_detached_worker("", "test"):
+        assert os.environ.get("ISSUE_3957_WPROBE") is None
+
+
+def test_detached_worker_scope_binds_profile_on_new_thread(monkeypatch, tmp_path):
+    """A worker thread re-binds the captured profile's TLS + env + cache path.
+
+    Reproduces the Codex CORE finding: WITHOUT the scope a new thread resolves
+    the default profile (cache path models_cache.json, no profile env); WITH it
+    the thread resolves the captured profile's cache file + .env.
+    """
+    import threading
+
+    base = tmp_path / ".hermes"
+    (base / "profiles" / "work").mkdir(parents=True)
+    (base / "profiles" / "work" / ".env").write_text(
+        "ISSUE_3957_WPROBE=worker-env\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    # Point the default models cache at an isolated tmp file so the named path
+    # derives from it (models_cache.work.json under the same dir).
+    default_cache = tmp_path / "state" / "models_cache.json"
+    default_cache.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(config, "_models_cache_path", default_cache)
+    monkeypatch.delenv("ISSUE_3957_WPROBE", raising=False)
+
+    out = {}
+
+    def worker():
+        # No TLS on this fresh thread yet → default profile resolution (the bug).
+        out["before_name"] = config._get_models_cache_path().name
+        out["before_env"] = os.environ.get("ISSUE_3957_WPROBE")
+        with profiles.profile_scope_for_detached_worker("work", "test-worker"):
+            out["inside_name"] = config._get_models_cache_path().name
+            out["inside_env"] = os.environ.get("ISSUE_3957_WPROBE")
+        out["after_name"] = config._get_models_cache_path().name
+        out["after_env"] = os.environ.get("ISSUE_3957_WPROBE")
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+
+    assert out["before_name"] == "models_cache.json"  # default (no scope)
+    assert out["before_env"] is None
+    assert out["inside_name"] == "models_cache.work.json"  # profile-scoped
+    assert out["inside_env"] == "worker-env"
+    assert out["after_name"] == "models_cache.json"  # restored
+    assert out["after_env"] is None
+

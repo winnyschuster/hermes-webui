@@ -5250,10 +5250,40 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
         with _cache_build_cv:
             _cache_build_in_progress = True
 
+        # Capture the active per-request profile (#3957). The live provider
+        # probe inside the rebuild resolves credentials from os.environ /
+        # HERMES_HOME and the disk-cache path/fingerprint from the profile TLS;
+        # the detached worker thread below inherits NEITHER, so it must be
+        # captured here (on the request thread, where the TLS is valid) and
+        # re-bound on the worker. Empty / default for single-profile installs.
+        from contextlib import nullcontext as _nullcontext
+
+        _active_profile_name = ""
+        _prof_env_request = None
+        _prof_scope_worker = None
+        try:
+            from api.profiles import (
+                get_active_profile_name as _gapn,
+                profile_env_for_active_request as _prof_env_request,
+                profile_scope_for_detached_worker as _prof_scope_worker,
+            )
+            _active_profile_name = (_gapn() or "").strip()
+        except Exception:
+            _prof_env_request = None
+            _prof_scope_worker = None
+
         # Legacy synchronous (unbounded) rebuild — opt-in via budget<=0.
         if _LIVE_REBUILD_BUDGET_SECONDS <= 0:
             try:
-                result = _invoke_models_rebuild(_build_available_models_uncached)
+                # Foreground thread already carries the request-profile TLS;
+                # apply the profile env (no-op for default) for the live probe.
+                _sync_scope = (
+                    _prof_env_request("models rebuild (sync)")
+                    if _prof_env_request is not None
+                    else _nullcontext()
+                )
+                with _sync_scope:
+                    result = _invoke_models_rebuild(_build_available_models_uncached)
             except BaseException:
                 # Always reset the flag so waiting threads don't block for 60s
                 with _cache_build_cv:
@@ -5329,20 +5359,34 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
                 return True
 
         def _rebuild_worker():
-            try:
-                box["result"] = _invoke_models_rebuild(_build_available_models_uncached)
-            except Exception as exc:  # noqa: BLE001 — propagated to caller
-                box["error"] = exc
-            finally:
-                build_done.set()
-                # Only publish out-of-band if the foreground already gave up
-                # (over budget). Within budget the foreground publishes
-                # synchronously, so the worker must NOT touch the cache.
-                if budget_exceeded.is_set() and _claim_publish():
-                    if "result" in box:
-                        _publish_models_result(box["result"])
-                    else:
-                        _clear_build_in_progress()
+            # Re-bind the captured per-request profile on THIS worker thread
+            # (#3957): the daemon inherits neither the request-profile TLS nor
+            # os.environ, so without this it would probe the default profile's
+            # credentials and, over budget, publish the rebuilt catalog to the
+            # DEFAULT profile's disk cache. No-op for the default profile.
+            _worker_scope = (
+                _prof_scope_worker(_active_profile_name, "models rebuild (worker)")
+                if _prof_scope_worker is not None
+                else _nullcontext()
+            )
+            with _worker_scope:
+                try:
+                    box["result"] = _invoke_models_rebuild(_build_available_models_uncached)
+                except Exception as exc:  # noqa: BLE001 — propagated to caller
+                    box["error"] = exc
+                finally:
+                    build_done.set()
+                    # Only publish out-of-band if the foreground already gave up
+                    # (over budget). Within budget the foreground publishes
+                    # synchronously, so the worker must NOT touch the cache.
+                    # NOTE: the publish (and its disk write + fingerprint) runs
+                    # INSIDE this profile scope so the over-budget path writes
+                    # the correct profile's cache file.
+                    if budget_exceeded.is_set() and _claim_publish():
+                        if "result" in box:
+                            _publish_models_result(box["result"])
+                        else:
+                            _clear_build_in_progress()
 
         _worker = threading.Thread(
             target=_rebuild_worker,
