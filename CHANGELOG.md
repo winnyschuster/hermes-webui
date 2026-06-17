@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.470] — 2026-06-17 — Release QE (transcript virtualization now experimental / off by default)
+
+### Changed
+
+- **Transcript virtualization is now experimental and off by default (#4343).** The windowed rendering of very long transcripts (#500/#4214) caused a scroll-up flicker on long sessions with large tool-call blocks — the viewport "flicks back and forth" while scrolling up (a variable-height virtual-scroll anchor oscillation, distinct from the stream-completion jump fixed in #4325). Until the scroll behavior can be made reliable, the "Virtualize long transcripts" preference now defaults **off** for everyone — including anyone who had it on during v0.51.469 — and is relabeled experimental/opt-in. By default the full transcript renders at once (no flicker, and the browser's Find/Ctrl+F matches the whole conversation). You can opt back in under Settings → Preferences. Thanks @b3nw for the report and A/B confirmation. (Root-cause scroll-stability work tracked separately.)
+
 ## [v0.51.469] — 2026-06-17 — Release QD (transcript virtualization fix + opt-out)
 
 ### Fixed

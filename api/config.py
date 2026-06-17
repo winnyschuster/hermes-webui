@@ -6875,7 +6875,8 @@ _SETTINGS_DEFAULTS = {
     "show_quota_chip": False,  # show ambient provider quota chip in composer footer (default off; wide desktop only when enabled, see style.css @media)
     "show_conversation_outline": False,  # show opt-in desktop jump-to-question outline panel
     "hide_empty_state_suggestions": False,  # hide the default new-chat suggestion buttons
-    "virtualize_transcript": True,  # #4325: virtualize long (>80 msg) transcripts; opt-OUT (default on) — off renders the full transcript
+    "virtualize_transcript": False,  # #4343: virtualize long (>80 msg) transcripts. EXPERIMENTAL, opt-IN (default OFF). Was opt-out/default-on in #4325 but caused scroll-up flicker on long sessions with tall tool-call rows (variable-height anchor oscillation) — flipped off for everyone in #4343; re-enabling requires an explicit opt-in (see virtualize_transcript_optin migration in load_settings).
+    "virtualize_transcript_optin": False,  # #4343 migration marker: True only once the user explicitly enables virtualize_transcript AFTER the default-off flip. A stored virtualize_transcript=True WITHOUT this marker is a stale pre-flip value and is reset to False on load (force-off-for-everyone migration).
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
     "show_cli_sessions": True,  # merge CLI/TUI/messaging sessions from state.db into the sidebar by default (#3988); established installs are grandfathered OFF by the load_settings backfill
@@ -7040,6 +7041,18 @@ def load_settings() -> dict:
                     bool(stored.get("onboarding_completed")) or _established_keys
                 ):
                     settings["show_cli_sessions"] = False
+                # Force-off-for-everyone migration for virtualize_transcript (#4343).
+                # The feature shipped opt-OUT/default-on in #4325, then proved to
+                # cause scroll-up flicker on long sessions (variable-height anchor
+                # oscillation). It is now EXPERIMENTAL/opt-IN (default off). Any
+                # stored virtualize_transcript=True from the #4325 window is a stale
+                # pre-flip value and must be reset to off, so 100% of existing users
+                # land on off — re-enabling requires an explicit opt-in made AFTER
+                # the flip, which writes virtualize_transcript_optin=True alongside.
+                # Honor a stored True only when that marker is present.
+                if not bool(stored.get("virtualize_transcript_optin")):
+                    settings["virtualize_transcript"] = False
+
         except Exception:
             logger.debug("Failed to load settings from %s", SETTINGS_FILE)
     settings["theme"], settings["skin"] = _normalize_appearance(
@@ -7084,6 +7097,7 @@ _SETTINGS_BOOL_KEYS = {
     "show_conversation_outline",
     "hide_empty_state_suggestions",
     "virtualize_transcript",
+    "virtualize_transcript_optin",
     "show_tps",
     "fade_text_effect",
     "show_cli_sessions",
