@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.522] — 2026-06-19 — Release SG (live model lookups never forward another provider's key)
+
+### Security
+
+- **`/api/models/live` no longer forwards the active provider's API key to a different provider's endpoint (#4488).** When a live-model lookup for provider X had no provider-scoped `providers.X.api_key`, the OpenAI-compat fallback used the top-level `model.api_key` unconditionally — which may belong to a different provider Y — and sent it as a bearer token to X's `{endpoint}/models` URL, leaking Y's credential to X's server. The fallback is now gated on the active `model.provider` resolving (via the same alias normalization) to the requested provider; on a mismatch no key is used, no request is made, and the static catalog is returned. Thanks @Hinotoi-agent.
+
 ## [v0.51.521] — 2026-06-19 — Release SF (imported sessions scoped to the active profile)
 
 ### Security
