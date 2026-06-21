@@ -152,45 +152,51 @@ function syncAppTitlebar() {
     };
   }
 
-  // Mobile touch interactions — wired once per element lifetime.
-  if ('ontouchstart' in window && !titleEl._mobileTouchWired) {
-    titleEl._mobileTouchWired = true;
+  // Dismiss stale popover on session/panel switch
+  const _existingPop = document.querySelector('.app-titlebar-title-popover');
+  if (_existingPop) _existingPop.remove();
 
-    // Tap-to-reveal full title popover
-    let _titlePopover = null;
-    const _dismissTitlePopover = () => {
-      if (_titlePopover) { _titlePopover.remove(); _titlePopover = null; }
-    };
-    titleEl.addEventListener('click', function _onTitleClick(e) {
-      if (_renamingAppTitlebar) return;
-      if (_titlePopover) {
-        _dismissTitlePopover();
-        if (typeof titleEl.ondblclick === 'function') titleEl.ondblclick(e);
-        return;
-      }
-      e.stopPropagation();
-      const pop = document.createElement('div');
-      pop.className = 'app-titlebar-title-popover';
-      pop.textContent = (S && S.session && S.session.title) ||
-        (typeof t === 'function' ? t('untitled') : 'Untitled');
-      document.body.appendChild(pop);
-      const rect = titleEl.getBoundingClientRect();
-      pop.style.top = (rect.bottom + 6) + 'px';
-      pop.style.left = Math.max(8, rect.left) + 'px';
-      pop.style.maxWidth = (window.innerWidth - 16) + 'px';
-      _titlePopover = pop;
-      const _outside = (ev) => {
-        if (!pop.contains(ev.target) && ev.target !== titleEl) {
-          _dismissTitlePopover();
-          document.removeEventListener('click', _outside, true);
-        }
+  // Mobile touch interactions
+  if ('ontouchstart' in window) {
+    // Tap-to-reveal full title popover — wired once per element lifetime
+    if (!titleEl._mobileTouchWired) {
+      titleEl._mobileTouchWired = true;
+      let _titlePopover = null;
+      const _dismissTitlePopover = () => {
+        if (_titlePopover) { _titlePopover.remove(); _titlePopover = null; }
       };
-      setTimeout(() => document.addEventListener('click', _outside, true), 0);
-    }, { passive: true });
+      titleEl.addEventListener('click', function _onTitleClick(e) {
+        if (_renamingAppTitlebar) return;
+        if (_titlePopover) {
+          _dismissTitlePopover();
+          return;
+        }
+        e.stopPropagation();
+        const pop = document.createElement('div');
+        pop.className = 'app-titlebar-title-popover';
+        pop.textContent = (S && S.session && S.session.title) ||
+          (typeof t === 'function' ? t('untitled') : 'Untitled');
+        document.body.appendChild(pop);
+        const rect = titleEl.getBoundingClientRect();
+        pop.style.top = (rect.bottom + 6) + 'px';
+        pop.style.left = Math.max(8, rect.left) + 'px';
+        pop.style.maxWidth = (window.innerWidth - 16) + 'px';
+        _titlePopover = pop;
+        const _outside = (ev) => {
+          if (!pop.contains(ev.target) && ev.target !== titleEl) {
+            _dismissTitlePopover();
+            document.removeEventListener('click', _outside, true);
+          }
+        };
+        setTimeout(() => document.addEventListener('click', _outside, true), 0);
+      }, { passive: true });
+    }
 
-    // Long-press → session action menu (mirrors project-chip pattern, sessions.js:5362-5407)
-    if (panel === 'chat' && S && S.session && !S.session.read_only && !S.session.is_read_only &&
+    // Long-press → session action menu (re-evaluated each sync so late-arriving sessions attach)
+    if (!titleEl._mobileLpWired && panel === 'chat' && S && S.session &&
+        !S.session.read_only && !S.session.is_read_only &&
         typeof _openSessionActionMenu === 'function') {
+      titleEl._mobileLpWired = true;
       let _lpTimer = null;
       let _lpHandled = false;
       let _lpStartX = 0, _lpStartY = 0;
