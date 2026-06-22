@@ -904,6 +904,12 @@ def filter_runtime_env_for_gateway_parity(env: dict[str, str]) -> dict[str, str]
 # inheriting the server-process credential (#3961 residual cross-profile leak).
 _NON_REGISTRY_AGENT_CREDENTIAL_ENV_NAMES: tuple[str, ...] = (
     "CUSTOM_API_KEY",
+    # Anthropic OAuth/token aliases. These ARE in the agent auth registry, but
+    # are duplicated here as a fail-closed floor so the scrub still covers them
+    # when the agent package can't be imported (e.g. a WebUI-only CI/test env
+    # where hermes_cli.auth is absent) — the registry union is best-effort.
+    "ANTHROPIC_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "AZURE_ANTHROPIC_KEY",
     "AZURE_FOUNDRY_API_KEY",
     "AZURE_CLIENT_ID",
