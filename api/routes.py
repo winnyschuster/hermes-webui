@@ -7052,6 +7052,15 @@ _LOGIN_LOCALE = {
         "invalid_pw": "Nieprawid\u0142owe has\u0142o",
         "conn_failed": "Po\u0142\u0105czenie nie powiod\u0142o si\u0119",
     },
+    "vi": {
+        "lang": "vi",
+        "title": "\u0110\u0103ng nh\u1eadp",
+        "subtitle": "Nh\u1eadp m\u1eadt kh\u1ea9u c\u1ee7a b\u1ea1n \u0111\u1ec3 ti\u1ebfp t\u1ee5c",
+        "placeholder": "M\u1eadt kh\u1ea9u",
+        "btn": "\u0110\u0103ng nh\u1eadp",
+        "invalid_pw": "M\u1eadt kh\u1ea9u kh\u00f4ng h\u1ee3p l\u1ec7",
+        "conn_failed": "K\u1ebft n\u1ed1i th\u1ea5t b\u1ea1i",
+    },
 }
 
 
