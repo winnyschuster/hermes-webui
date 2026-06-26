@@ -6167,6 +6167,8 @@ function _attachProjectQuickCreateButton(chip, project){
   };
   btn.ondblclick=(e)=>{stop(e);};
   btn.oncontextmenu=(e)=>{stop(e);};
+  btn.ontouchstart=(e)=>{stop(e);};
+  btn.ontouchend=(e)=>{stop(e);};
   chip.appendChild(btn);
 }
 

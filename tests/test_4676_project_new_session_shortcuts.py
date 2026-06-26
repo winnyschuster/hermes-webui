@@ -50,6 +50,8 @@ def test_quick_create_button_attaches_filter_align_and_request_path():
     assert "newSession(false,{project_id:project.project_id})" in helper
     assert "btn.ondblclick" in helper
     assert "btn.oncontextmenu" in helper
+    assert "btn.ontouchstart" in helper
+    assert "btn.ontouchend" in helper
 
 
 def test_project_quick_create_styles_exist_and_are_discrete_to_pointer_layouts():
@@ -64,8 +66,8 @@ def test_project_quick_create_styles_exist_and_are_discrete_to_pointer_layouts()
 def _run_new_session_case(options, active_project=None):
     _DRIVER = r"""
 const fs = require('fs');
-const path = process.argv[1];
-const args = JSON.parse(process.argv[2]);
+const [path, argsJson] = process.argv.slice(-2);
+const args = JSON.parse(argsJson);
 const src = fs.readFileSync(path, 'utf8');
 
 function extractAsyncFunction(source, name) {
@@ -200,8 +202,9 @@ def test_new_session_falls_back_to_active_project_when_override_missing():
 
 _HELPER = r"""
 const fs = require('fs');
-const sessionsSrc = fs.readFileSync(process.argv[1], 'utf8');
-const params = JSON.parse(process.argv[2]);
+const [sessionsPath, paramsJson] = process.argv.slice(-2);
+const sessionsSrc = fs.readFileSync(sessionsPath, 'utf8');
+const params = JSON.parse(paramsJson);
 
 function extractFunction(source, name) {
   const marker = `function ${name}(`;
@@ -259,6 +262,8 @@ const ev = {
 btn.onclick(ev);
 btn.ondblclick(ev);
 btn.oncontextmenu(ev);
+btn.ontouchstart(ev);
+btn.ontouchend(ev);
 console.log(JSON.stringify({
   buttonClass: btn.className,
   buttonTag: btn.tagName,
@@ -305,6 +310,6 @@ def test_project_chip_quick_create_keeps_active_filter_and_uses_project_override
     assert out["newSession"] == {"flash": False, "options": {"project_id": "project-123"}}
     assert {"type": "set-filter", "projectId": "project-123"} in out["calls"]
     assert {"type": "new-session", "flash": False, "options": {"project_id": "project-123"}} in out["calls"]
-    assert out["stopCount"] >= 3
-    assert out["preventCount"] >= 3
-    assert out["stopImmediateCount"] >= 3
+    assert out["stopCount"] >= 5
+    assert out["preventCount"] >= 5
+    assert out["stopImmediateCount"] >= 5
