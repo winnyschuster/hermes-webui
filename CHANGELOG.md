@@ -35,6 +35,8 @@
 
 ### Fixed
 
+- **Delegated subagent sessions no longer flicker or vanish from the sidebar during an active parent turn.** A linked delegate child of the currently-active session is now kept visible even when it transiently reports zero messages between session-list polls (previously it was dropped by the visibility filter, then reappeared on the next refresh). The exception is scoped strictly to children of the active parent, so unrelated empty sessions stay hidden. (#5320, fixes #5306 and #5305)
+
 - **The Busy input mode preference (queue / interrupt / steer) is honored on the first send after load.** Previously a send that happened before the async boot settings resolved fell back to `queue`, ignoring a saved `steer`/`interrupt` preference until it was re-saved. The preference is now mirrored to localStorage and applied eagerly on boot, on settings-load failure, and whenever it's changed via Settings. Thanks @b3nw for the report. (#5170, fixes #5167)
 
 - **Historical `reasoning_content` is no longer replayed to local/generic model backends that can't use it.** Provider-facing conversation history now gates `reasoning_content` replay: preserved by default (no change for cloud providers), stripped only on explicit `webui.reasoning_content_replay='strip'` or a confidently-local `auto` backend (LM Studio / Ollama / llama.cpp / generic OpenAI-compatible). Persisted transcripts are untouched. Thanks @Stacey2911. (#5024)
