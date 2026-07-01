@@ -18047,6 +18047,8 @@ def _handle_btw(handler, body):
         require(body, "question")
     except ValueError as e:
         return bad(handler, str(e))
+    if _session_is_subagent_view_only(str(body.get("session_id") or "")):
+        return bad(handler, "Subagent sessions are view-only and cannot be used for /btw from WebUI", 400)
     try:
         s = get_session(body["session_id"])
     except KeyError:
@@ -18869,6 +18871,8 @@ def _handle_goal_command(handler, body):
         require(body, "session_id")
     except ValueError as e:
         return bad(handler, str(e))
+    if _session_is_subagent_view_only(str(body.get("session_id") or "")):
+        return bad(handler, "Subagent sessions are view-only and cannot run /goal from WebUI", 400)
     try:
         s = get_session(body["session_id"])
     except KeyError:
