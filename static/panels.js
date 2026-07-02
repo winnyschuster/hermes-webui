@@ -8776,7 +8776,7 @@ async function loadSettingsPanel(){
     const ttsRateValue=$('settingsTtsRateValue');
     if(ttsRateSlider){
       const savedRate=_speechSetting('tts_rate','hermes-tts-rate',1);
-      ttsRateSlider.value=savedRate||'1';
+      ttsRateSlider.value=(savedRate===null||savedRate===undefined)?'1':String(savedRate);
       if(ttsRateValue) ttsRateValue.textContent=parseFloat(ttsRateSlider.value).toFixed(1)+'x';
       localStorage.setItem('hermes-tts-rate',ttsRateSlider.value);
       ttsRateSlider.oninput=function(){if(ttsRateValue)ttsRateValue.textContent=parseFloat(this.value).toFixed(1)+'x';localStorage.setItem('hermes-tts-rate',this.value);_schedulePreferencesAutosave();};
@@ -8785,7 +8785,7 @@ async function loadSettingsPanel(){
     const ttsPitchValue=$('settingsTtsPitchValue');
     if(ttsPitchSlider){
       const savedPitch=_speechSetting('tts_pitch','hermes-tts-pitch',1);
-      ttsPitchSlider.value=savedPitch||'1';
+      ttsPitchSlider.value=(savedPitch===null||savedPitch===undefined)?'1':String(savedPitch);
       if(ttsPitchValue) ttsPitchValue.textContent=parseFloat(ttsPitchSlider.value).toFixed(1);
       localStorage.setItem('hermes-tts-pitch',ttsPitchSlider.value);
       ttsPitchSlider.oninput=function(){if(ttsPitchValue)ttsPitchValue.textContent=parseFloat(this.value).toFixed(1);localStorage.setItem('hermes-tts-pitch',this.value);_schedulePreferencesAutosave();};

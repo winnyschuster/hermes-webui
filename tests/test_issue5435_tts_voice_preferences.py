@@ -67,7 +67,7 @@ def test_settings_api_round_trips_speech_preferences():
         "tts_engine": "voicevox_local",
         "tts_voice": "en-US-AriaNeural",
         "tts_rate": "1.4",
-        "tts_pitch": "0.8",
+        "tts_pitch": "0",
         "voice_mode_button": True,
         "voice_continuous": True,
         "voice_silence_ms": "2400",
@@ -84,7 +84,7 @@ def test_settings_api_round_trips_speech_preferences():
         assert saved["tts_engine"] == "voicevox_local"
         assert saved["tts_voice"] == "en-US-AriaNeural"
         assert saved["tts_rate"] == 1.4
-        assert saved["tts_pitch"] == 0.8
+        assert saved["tts_pitch"] == 0.0
         assert saved["voice_mode_button"] is True
         assert saved["voice_continuous"] is True
         assert saved["voice_silence_ms"] == 2400
@@ -193,6 +193,10 @@ def test_settings_panel_persists_speech_fields_and_keeps_immediate_cache_writes(
     ]:
         assert storage_key in panel_block or storage_key in payload_block
     assert "_speechSetting('tts_engine','hermes-tts-engine','browser')" in panel_block
+    assert "savedRate||'1'" not in panel_block
+    assert "savedPitch||'1'" not in panel_block
+    assert "ttsRateSlider.value=(savedRate===null||savedRate===undefined)?'1':String(savedRate)" in panel_block
+    assert "ttsPitchSlider.value=(savedPitch===null||savedPitch===undefined)?'1':String(savedPitch)" in panel_block
     assert "serverBool===fallbackBool&&storedBool!==fallbackBool" in PANELS_JS
     assert "String(server)===String(fallback)&&String(stored)!==String(fallback)" in PANELS_JS
     assert "_schedulePreferencesAutosave()" in panel_block
