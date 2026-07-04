@@ -20347,13 +20347,15 @@ def _handle_chat_sync(handler, body):
             _previous_context_messages,
             _result_messages,
         )
+        # Mint ids on the shared result rows BEFORE dedupe deep-copies any
+        # stale-user boundary row, so both arrays share the id (#5564).
+        _assign_stable_message_ids(
+            _result_messages, _previous_messages, _previous_context_messages
+        )
         _next_context_messages = _dedupe_replayed_context_messages(
             _previous_context_messages,
             _next_context_messages,
             msg,
-        )
-        _assign_stable_message_ids(
-            _result_messages, _previous_messages, _previous_context_messages
         )
         s.context_messages = _next_context_messages
         s.messages = _merge_display_messages_after_agent_result(

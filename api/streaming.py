@@ -8240,17 +8240,20 @@ def _run_agent_streaming(
                         _previous_context_messages,
                         _result_messages,
                     )
+                    # Stamp stable ids on the shared result rows AFTER the context
+                    # restore (so carried-forward ids survive) and BEFORE the
+                    # dedupe/merge build both arrays — including before
+                    # _dedupe_replayed_context_messages deep-copies any
+                    # stale-user repaired boundary row — so display and
+                    # model-context copies of each row share an id for the
+                    # fork/truncate aligner.
+                    _assign_stable_message_ids(
+                        _result_messages, _previous_messages, _previous_context_messages
+                    )
                     _next_context_messages = _dedupe_replayed_context_messages(
                         _previous_context_messages,
                         _next_context_messages,
                         msg_text,
-                    )
-                    # Stamp stable ids on the shared result rows AFTER the context
-                    # restore (so carried-forward ids survive) and BEFORE both
-                    # arrays are built, so display and model-context copies of each
-                    # row share an id for the fork/truncate aligner.
-                    _assign_stable_message_ids(
-                        _result_messages, _previous_messages, _previous_context_messages
                     )
                     s.context_messages = _deduplicate_context_messages(_next_context_messages)
                     s.messages = _merge_display_messages_after_agent_result(
@@ -8557,13 +8560,16 @@ def _run_agent_streaming(
                                     _previous_context_messages,
                                     _result_messages,
                                 )
+                                # Mint ids on the shared result rows BEFORE dedupe
+                                # deep-copies any stale-user boundary row, so both
+                                # arrays share the id (#5564).
+                                _assign_stable_message_ids(
+                                    _result_messages, _previous_messages, _previous_context_messages
+                                )
                                 _next_context_messages = _dedupe_replayed_context_messages(
                                     _previous_context_messages,
                                     _next_context_messages,
                                     msg_text,
-                                )
-                                _assign_stable_message_ids(
-                                    _result_messages, _previous_messages, _previous_context_messages
                                 )
                                 s.context_messages = _deduplicate_context_messages(_next_context_messages)
                                 s.messages = _merge_display_messages_after_agent_result(
@@ -9616,13 +9622,16 @@ def _run_agent_streaming(
                                 _next_context_messages = _restore_reasoning_metadata(
                                     _previous_context_messages, _result_messages,
                                 )
+                                # Mint ids on the shared result rows BEFORE dedupe
+                                # deep-copies any stale-user boundary row, so both
+                                # arrays share the id (#5564).
+                                _assign_stable_message_ids(
+                                    _result_messages, _previous_messages, _previous_context_messages
+                                )
                                 _next_context_messages = _dedupe_replayed_context_messages(
                                     _previous_context_messages,
                                     _next_context_messages,
                                     msg_text,
-                                )
-                                _assign_stable_message_ids(
-                                    _result_messages, _previous_messages, _previous_context_messages
                                 )
                                 s.context_messages = _deduplicate_context_messages(_next_context_messages)
                                 s.messages = _merge_display_messages_after_agent_result(
