@@ -1444,12 +1444,15 @@ def _canonicalise_provider_id(name: object) -> str:
     # keep as-is to avoid round-tripping through aliases (e.g. x-ai → xai).
     if raw in _PROVIDER_DISPLAY or raw in _PROVIDER_MODELS:
         return raw
-    # Try alias resolution. Only accept the result if it's itself a
-    # canonical id in _PROVIDER_DISPLAY — that prevents aliases pointing
-    # at non-canonical strings (legacy, hermes_cli-specific) from leaking
-    # in. Falls back to the normalised input otherwise.
+    # Try alias resolution. Accept the result if it's a canonical id known to
+    # either _PROVIDER_DISPLAY OR _PROVIDER_MODELS (mirroring the direct-hit
+    # check above) — some canonical targets (e.g. `gemini`) are indexed in
+    # _PROVIDER_MODELS but not _PROVIDER_DISPLAY, so a _DISPLAY-only check
+    # rejected valid aliases like `google-gemini`→`gemini`, leaving the id
+    # uncanonicalised and silently breaking provider-ownership checks (#5511).
+    # This still blocks aliases that point at non-canonical/legacy strings.
     resolved = _resolve_provider_alias(raw)
-    if resolved and resolved.lower() in _PROVIDER_DISPLAY:
+    if resolved and (resolved.lower() in _PROVIDER_DISPLAY or resolved.lower() in _PROVIDER_MODELS):
         return resolved.lower()
     return raw
 

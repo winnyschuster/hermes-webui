@@ -871,3 +871,29 @@ def test_providers_scan_ownership_guard_canonicalises_aliased_active_provider_55
         "aliased active provider (z-ai→zai) that owns the model must not be "
         f"hijacked by providers.openai.models; got {provider!r}"
     )
+
+
+def test_providers_scan_ownership_guard_canonicalises_gemini_alias_5511():
+    """A Gemini-family alias (google-gemini → gemini) must canonicalise so the
+    active provider is recognized as owning its catalog models (#5511 latent bug:
+    `gemini` is in _PROVIDER_MODELS but not _PROVIDER_DISPLAY, so the alias was
+    rejected and the ownership guard silently failed)."""
+    import api.config as config
+    assert config._canonicalise_provider_id('google-gemini') == 'gemini', (
+        "google-gemini must canonicalise to gemini"
+    )
+    gem_models = config._PROVIDER_MODELS.get('gemini') or []
+    gem_ids = [m.get('id') for m in gem_models if isinstance(m, dict) and m.get('id')]
+    if not gem_ids:
+        import pytest
+        pytest.skip("no gemini catalog models to exercise the alias ownership guard")
+    owned = gem_ids[0]
+    model, provider, base_url = _resolve_with_providers(
+        owned,
+        {'openai': {'models': [owned]}},
+        provider='google-gemini',
+    )
+    assert provider == 'google-gemini', (
+        "aliased active Gemini provider that owns the model must not be hijacked "
+        f"by providers.openai.models; got {provider!r}"
+    )
