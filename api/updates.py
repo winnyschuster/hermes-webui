@@ -70,15 +70,11 @@ _GIT_LOCK_SIGNATURES = (
     'another git process seems to be running',
     'unable to create .git/index.lock',
 )
-# Lock files we are willing to remove on the *explicit user request* path
-# (`/api/updates/clear_lock`). The clear_lock endpoint refuses to remove any
-# lock whose underlying file appears to still be held by another process --
-# there is no mtime-based heuristic any more (BRICK-1 from PR #5688 gate
-# cert: a live `git add` was empirically shown to hold .git/index.lock past
-# 31 s with unchanged mtime).
-_GIT_LOCK_FILES_REMOVABLE = (
-    'index.lock',
-)
+# Lock files we previously enumerated for auto-removal in v2. v2.2 no longer
+# removes anything on the server, so the enumerable list is no longer needed;
+# ``_inventory_locks`` reports whatever ``.git/**/*.lock`` files currently exist
+# via plain ``rglob``.
+
 
 
 def _sanitize_git_diagnostic(output: str, *, limit: int = _GIT_DIAGNOSTIC_MAX_CHARS) -> str:
@@ -242,95 +238,70 @@ def _is_git_lock_error(output: str) -> bool:
     return any(sig in lower_out for sig in _GIT_LOCK_SIGNATURES)
 
 
-def _is_lock_held(lock_path: Path) -> bool:
-    """Return True if a process appears to still hold ``lock_path``.
+def _inventory_locks(path: Path) -> dict:
+    """Return a snapshot of lock files currently present under ``path/.git``.
 
-    Used by the explicit `clear_lock` recovery path. The implementer is
-    intentionally conservative: a process hold signal returns True and the
-    caller refuses to remove the lock. If we cannot prove a holder exists
-    *and cannot prove one does not*, we still return True (fail-closed) on
-    the common case the OS denies `flock`/delete.
-
-    Currently: tries a non-blocking exclusive fcntl.flock on POSIX. Any
-    `BlockingIOError` means another process holds the lock. On platforms
-    without fcntl (Windows), returns True unconditionally so the endpoint
-    surfaces a manual-instruction message rather than risking corruption.
+    v2.2: replaced v2's `_is_lock_held` + `_try_remove_lock` machinery with
+    pure inventory. Round-2 cert (gate-fail) proved that `fcntl.flock`
+    cannot detect a live git lock, because git uses `O_CREAT|O_EXCL` and
+    `rename(2)`, NOT advisory locking. Any auto-delete path can therefore
+    race against a running `git add` and corrupt the index. v2.2 stops
+    deleting locks from the server entirely: the only thing that removes
+    a lock is the user, on the host, via the manual command surfaced in
+    the response. Once the lock is gone, the user re-clicks Update Now
+    and the normal non-destructive apply path runs.
     """
-    if not lock_path.exists():
-        return False
+    git_dir = path / '.git'
+    out = {
+        'well_known_lock_present': False,  # ``.git/index.lock`` exists?
+        'well_known_lock_path': None,      # absolute path of ``.git/index.lock``
+        'other_locks': [],                  # any other lock files, by relative path
+    }
+    if not git_dir.exists():
+        return out
+    well_known = git_dir / 'index.lock'
     try:
-        import fcntl  # local import keeps Windows imports happy
-    except ImportError:
-        # No fcntl on this platform -- cannot prove non-hold. Fail closed.
-        return True
-    try:
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_NOFOLLOW)
+        out['well_known_lock_present'] = well_known.exists()
     except OSError:
-        # Cannot open the file (deleted, perm-denied, etc.). Treat as
-        # held so the caller asks the user to act.
-        return True
+        # Permission problem reading the directory -- treat conservatively.
+        out['well_known_lock_present'] = True
+    out['well_known_lock_path'] = str(well_known)
+
+    # Enumerate every other lock file under .git/ for diagnostic reporting.
+    # We never touch them; this is purely an inventory.
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError):
-            return True
-        # We acquired the lock; release immediately and report not-held.
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        return False
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
-def _try_remove_lock(path: Path, logger_obj: logging.Logger | None = None) -> tuple[bool, str]:
-    """Best-effort removal of a git lock file. Refuses if a holder is detected.
-
-    Returns ``(removed, diagnostic)``. ``removed`` is True only if the file
-    was successfully unlinked. ``diagnostic`` is a human-readable reason
-    string for logging and for the HTTP response message.
-    """
-    if not path.exists():
-        return False, 'no-such-file'
-    if _is_lock_held(path):
-        if logger_obj is not None:
-            logger_obj.warning(
-                'clear_lock: refusing to remove %s -- appears held', path
-            )
-        return False, 'lock-held-by-another-process'
-    try:
-        os.remove(path)
-    except OSError as exc:
-        if logger_obj is not None:
-            logger_obj.warning(
-                'clear_lock: os.remove failed for %s: %s', path, exc
-            )
-        return False, f'remove-failed: {exc}'
-    if logger_obj is not None:
-        logger_obj.info('clear_lock: removed %s', path)
-    return True, 'removed'
+        for entry in sorted(git_dir.rglob('*.lock')):
+            try:
+                rel = str(entry.relative_to(git_dir))
+            except ValueError:
+                continue
+            if rel == 'index.lock':
+                continue
+            out['other_locks'].append(rel)
+    except OSError:
+        # rglob can fail on unreadable subtrees; skip quietly.
+        pass
+    return out
 
 
 def apply_clear_lock(target: str) -> dict:
-    """Non-destructively attempt to clear a stale git lock for ``target``.
+    """Manual-instruction lock recovery for ``target``.
 
-    Replaces the v1 approach of pre-clearing locks inside ``apply_force_update``.
-    v1's mtime heuristic was proven unsafe in PR #5688 gate cert (BRICK-1):
-    a live git add was empirically shown to hold ``.git/index.lock`` past
-    31 s with the lock's mtime unchanged, so age is not a proxy for staleness.
+    v2.2: NEVER removes a lock file. Strategy:
 
-    v2 strategy:
-      - Refuse to remove any lock file that another process currently holds
-        (probe via non-blocking fcntl.flock; on non-POSIX, fail closed).
-      - Only touch ``.git/index.lock`` (the only well-known short-lived lock
-        git creates); other lock files (``refs/**/*.lock``, ``FETCH_HEAD.lock``,
-        ...) are reported in the response for the operator to handle manually.
-      - On success, retry ``_apply_update_inner`` once to apply the update.
-        (No ``checkout`` / ``clean`` / ``reset --hard`` -- safe by design.)
+      - If ``.git/index.lock`` is absent: re-run the normal non-destructive
+        apply path so the user lands on the latest version without ever
+        touching destructive git operations.
+      - If ``.git/index.lock`` is present: do NOT touch it -- the server
+        has no reliable proof that no live git process is still using
+        it (round-2 cert showed `fcntl.flock` does not detect git's
+        actual ``O_CREAT|O_EXCL`` locking). Return a response with the
+        exact manual command the operator can run, plus the inventory of
+        any other lock files so they can investigate. The frontend then
+        surfaces a copyable ``rm`` line and a "I've removed the lock --
+        try update again" button that re-invokes this endpoint, which
+        (now that the lock is gone) will take the success branch and
+        re-run the normal apply.
     """
     blocker_snapshot = _restart_blocker_snapshot()
     if blocker_snapshot.get('restart_blocked'):
@@ -350,60 +321,43 @@ def apply_clear_lock(target: str) -> dict:
         if path is None or not (path / '.git').exists():
             return {'ok': False, 'message': 'Not a git repository'}
 
-        git_dir = path / '.git'
-        # Only attempt removal of well-known short-lived lock files. Anything
-        # outside _GIT_LOCK_FILES_REMOVABLE is returned in the report so the
-        # operator can inspect it.
-        removed: list[str] = []
-        refused: list[str] = []
-        for name in _GIT_LOCK_FILES_REMOVABLE:
-            ok, diag = _try_remove_lock(git_dir / name)
-            if ok:
-                removed.append(name)
-            elif diag != 'no-such-file':
-                refused.append(f'{name} ({diag})')
+        inv = _inventory_locks(path)
+        manual_command = f"rm -f {inv['well_known_lock_path']}"
 
-        # Detect other lock files (refs/heads/<branch>.lock etc) for the
-        # diagnostic -- but never delete them here.
-        other_locks: list[str] = []
-        for entry in sorted(git_dir.rglob('*.lock')):
-            rel = str(entry.relative_to(git_dir))
-            if rel not in _GIT_LOCK_FILES_REMOVABLE:
-                other_locks.append(rel)
-
-        if refused and not removed:
-            # All attempted removals were refused -- surface a clean
-            # manual-instruction response.
-            return {
-                'ok': False,
-                'message': (
-                    'Cannot safely clear the lock: '
-                    + '; '.join(refused)
-                    + '. A concurrent git process appears to hold the lock. '
-                    + 'Wait for it to finish, then retry. As a last resort, '
-                    + 'run: rm -f ' + str(git_dir / _GIT_LOCK_FILES_REMOVABLE[0])
-                ),
-                'lock_held': True,
-                'target': target,
-                'refused': refused,
-                'other_locks': other_locks,
+        if not inv['well_known_lock_present']:
+            # Lock is gone. Run the normal non-destructive update flow and
+            # annotate the response with what we found for the user's
+            # records.
+            with _cache_lock:
+                _update_cache['checked_at'] = 0
+            retry_result = _apply_update_inner(target)
+            retry_result = dict(retry_result)
+            retry_result['lock_recovery'] = {
+                'action': 'no-lock-found',
+                'manual_command': manual_command,
+                'other_locks': inv['other_locks'],
             }
+            return retry_result
 
-        # Invalidate cache so the next status check is fresh.
-        with _cache_lock:
-            _update_cache['checked_at'] = 0
-
-        # Now retry the normal (non-destructive) update flow once. If this
-        # succeeds the user gets their update without any checkout/clean/reset.
-        retry_result = _apply_update_inner(target)
-        # Annotate with the recovery summary so the UI can show what happened.
-        retry_result = dict(retry_result)
-        retry_result['lock_recovery'] = {
-            'removed': removed,
-            'refused': refused,
-            'other_locks': other_locks,
+        # Lock is present. The server cannot prove it's safe to delete;
+        # the only safe path is to ask the operator.
+        message = (
+            'A git lock file (.git/index.lock) is present. The server does '
+            'not delete locks automatically -- git uses O_CREAT|O_EXCL '
+            'locking, which cannot be detected with advisory probes. To '
+            'recover: confirm no other git process is running against '
+            f'this checkout, then run: {manual_command}  '
+            'Click "Retry update" once you have removed it.'
+        )
+        return {
+            'ok': False,
+            'message': message,
+            'lock_held': True,
+            'target': target,
+            'manual_command': manual_command,
+            'well_known_lock_path': inv['well_known_lock_path'],
+            'other_locks': inv['other_locks'],
         }
-        return retry_result
     finally:
         _apply_lock.release()
 

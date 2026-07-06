@@ -1,6 +1,5 @@
 """Tests for self-update diagnostics (api/updates.py)."""
 import os
-import sys
 import time
 from unittest.mock import MagicMock, patch
 
@@ -1046,79 +1045,95 @@ def test_apply_force_update_no_longer_touches_locks(tmp_path, monkeypatch):
     )
 
 
-# ── v2 tests for PR #5688 ──────────────────────────────────────────────────
+# ── v2 (Round-2) tests for PR #5688 ──────────────────────────────────────────
+#
+# v2.2 dropped v2's fcntl-flock holder probe + os.remove path entirely.
+# Those round-2 functions (`_is_lock_held`, `_try_remove_lock`) are
+# removed in v2.2 because they were proven unsafe (Codex strace showed
+# git uses O_CREAT|O_EXCL, not advisory locking). The deletion tests
+# below assert they no longer exist -- if a future refactor reintroduces
+# either, those tests fail loud. The replacements for them are the v2.2
+# inventory + apply_clear_lock tests further below.
 
 
-@pytest.mark.skipif(sys.platform.startswith('win'),
-                    reason='fcntl-based holder probe is POSIX-only')
-def test_is_lock_held_returns_false_when_no_other_holder(tmp_path):
-    """An unheld .git/index.lock passes the holder probe."""
-    lock = tmp_path / 'index.lock'
-    lock.write_text('')
-    assert updates._is_lock_held(lock) is False
+def test_v2_probe_helpers_removed():
+    """v2.2 contract: the round-2 fcntl-flock probe machinery is gone.
 
-
-@pytest.mark.skipif(sys.platform.startswith('win'),
-                    reason='fcntl-based holder probe is POSIX-only')
-def test_is_lock_held_returns_true_when_other_process_holds(tmp_path):
-    """If an external process holds the lock via flock, the probe returns True."""
-    lock = tmp_path / 'index.lock'
-    lock.write_text('')
-    # Simulate a holder by acquiring flock ourselves from this process.
-    import fcntl
-    fd = os.open(str(lock), os.O_RDWR)
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    try:
-        # Now the probe (a different os.open + flock attempt) must fail
-        # and return True, refusing removal.
-        assert updates._is_lock_held(lock) is True
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
-
-
-def test_try_remove_lock_refuses_when_held(tmp_path, monkeypatch):
-    """_try_remove_lock must NEVER touch a file if a holder is detected."""
-    lock = tmp_path / 'index.lock'
-    lock.write_text('sentinel')
-
-    monkeypatch.setattr(
-        updates, '_is_lock_held', lambda p: True
+    Round-2 cert proved `flock` cannot detect git's O_CREAT|O_EXCL locks,
+    so any auto-delete path can race a running git process. This guard
+    test fails loud if anyone reintroduces either helper.
+    """
+    assert not hasattr(updates, '_is_lock_held'), (
+        "_is_lock_held was re-introduced after v2.2 removal -- round-2 cert "
+        "showed fcntl.flock cannot detect git locks; do not bring it back."
     )
-    ok, diag = updates._try_remove_lock(lock)
-    assert ok is False
-    assert diag == 'lock-held-by-another-process'
-    assert lock.exists(), "Lock must NOT be removed when a holder is detected"
-    assert lock.read_text() == 'sentinel', "Lock contents must NOT be modified"
+    assert not hasattr(updates, '_try_remove_lock'), (
+        "_try_remove_lock was re-introduced after v2.2 removal -- auto-delete "
+        "from the server is unsafe on a brick-risk path; do not bring it back."
+    )
 
 
-def test_try_remove_lock_succeeds_when_unheld(tmp_path, monkeypatch):
-    ok, diag = updates._try_remove_lock(tmp_path / 'nope')
-    assert ok is False and diag == 'no-such-file'
-
-    lock = tmp_path / 'index.lock'
-    lock.write_text('')
-    monkeypatch.setattr(updates, '_is_lock_held', lambda p: False)
-    ok, diag = updates._try_remove_lock(lock)
-    assert ok is True, diag
-    assert not lock.exists()
+# ── v2.2 tests for PR #5688 ──────────────────────────────────────────────────
+#
+# v2.2 dropped v2's fcntl-flock holder probe and os.remove path entirely.
+# ``apply_clear_lock`` is now inventory-only and manual-instruction: if
+# the lock is gone it re-runs the normal update; if the lock is present
+# it returns the exact ``rm`` command the operator must run. These tests
+# lock in that contract.
 
 
-def test_apply_clear_lock_removes_unheld_lock_and_runs_normal_update(tmp_path,
-                                                                     monkeypatch):
-    """clear_lock removes an unheld index.lock and re-runs the normal update path."""
+def test_inventory_locks_reports_when_index_lock_present(tmp_path):
+    """Inventory must report well_known_lock_present=True when .git/index.lock
+    exists, plus its absolute path."""
     (tmp_path / '.git').mkdir()
     lock = tmp_path / '.git' / 'index.lock'
-    lock.write_text('')
-    monkeypatch.setattr(updates, '_is_lock_held', lambda p: False)
+    lock.write_text('stale')
+    inv = updates._inventory_locks(tmp_path)
+    assert inv['well_known_lock_present'] is True
+    assert inv['well_known_lock_path'] == str(lock)
+    assert inv['other_locks'] == []
 
-    fake_git_calls = []
 
-    def fake_git(args, cwd, timeout=10):
-        fake_git_calls.append(args)
-        return '', True
+def test_inventory_locks_reports_when_index_lock_absent(tmp_path):
+    """Inventory must report well_known_lock_present=False when no lock exists."""
+    (tmp_path / '.git').mkdir()
+    inv = updates._inventory_locks(tmp_path)
+    assert inv['well_known_lock_present'] is False
+    assert inv['other_locks'] == []
 
-    monkeypatch.setattr(updates, '_run_git', fake_git)
+
+def test_inventory_locks_lists_other_locks(tmp_path):
+    """Inventory must enumerate refs/*.lock etc without including index.lock."""
+    (tmp_path / '.git').mkdir()
+    (tmp_path / '.git' / 'index.lock').write_text('')
+    (tmp_path / '.git' / 'refs' / 'heads').mkdir(parents=True)
+    (tmp_path / '.git' / 'refs' / 'heads' / 'main.lock').write_text('')
+    (tmp_path / '.git' / 'FETCH_HEAD.lock').write_text('')
+    inv = updates._inventory_locks(tmp_path)
+    assert inv['well_known_lock_present'] is True
+    assert sorted(inv['other_locks']) == [
+        'FETCH_HEAD.lock',
+        'refs/heads/main.lock',
+    ]
+
+
+def test_inventory_locks_handles_missing_git_dir(tmp_path):
+    """When ``.git`` does not exist the inventory must still return a valid shape."""
+    inv = updates._inventory_locks(tmp_path)
+    assert inv == {
+        'well_known_lock_present': False,
+        'well_known_lock_path': None,
+        'other_locks': [],
+    }
+
+
+def test_apply_clear_lock_with_no_lock_runs_normal_update(tmp_path, monkeypatch):
+    """v2.2: when ``.git/index.lock`` is absent, apply_clear_lock re-runs
+    the normal non-destructive apply path."""
+    (tmp_path / '.git').mkdir()
+    # No lock file written.
+    monkeypatch.setattr(updates, '_run_git',
+                         MagicMock(return_value=('', True)))
     monkeypatch.setattr(updates, 'REPO_ROOT', tmp_path)
     monkeypatch.setattr(
         updates, '_restart_blocker_snapshot',
@@ -1128,22 +1143,34 @@ def test_apply_clear_lock_removes_unheld_lock_and_runs_normal_update(tmp_path,
         updates, '_select_apply_compare_ref',
         lambda path: 'origin/main'
     )
-
     result = updates.apply_clear_lock('webui')
     assert result['ok'] is True, result
-    assert result.get('lock_recovery', {}).get('removed') == ['index.lock']
-    assert not lock.exists()
+    assert result['lock_recovery']['action'] == 'no-lock-found'
+    assert 'manual_command' in result['lock_recovery']
+    assert 'rm -f' in result['lock_recovery']['manual_command']
 
 
-def test_apply_clear_lock_refuses_when_lock_held(tmp_path, monkeypatch):
-    """If a holder is detected, clear_lock must NOT remove the lock and must
-    return a manual-instruction response."""
+def test_apply_clear_lock_with_lock_present_returns_manual_instruction(tmp_path, monkeypatch):
+    """v2.2: when a lock is present, apply_clear_lock must NEVER touch the
+    lock file; it returns ok=False with a manual-instruction response."""
     (tmp_path / '.git').mkdir()
     lock = tmp_path / '.git' / 'index.lock'
-    lock.write_text('do-not-touch')
+    lock.write_text('user-removed-this-by-hand')
 
-    # Always appear held.
-    monkeypatch.setattr(updates, '_is_lock_held', lambda p: True)
+    # Spy: capture whether the server attempted to delete anything. The
+    # correct v2.2 behavior is NO DELETE attempt whatsoever, regardless
+    # of any property of the lock file.
+    delete_attempts = []
+
+    def forbid_delete(*args, **kwargs):
+        delete_attempts.append((args, kwargs))
+        # Use a sentinel that will NEVER happen; if delete is called the
+        # test must fail. The cheap way: just record the attempt.
+        return None
+
+    # Patch os.remove + Path.unlink on the instance/module to record any
+    # destructive attempt. apply_clear_lock must NOT call them.
+    monkeypatch.setattr(updates.os, 'remove', forbid_delete)
     monkeypatch.setattr(updates, 'REPO_ROOT', tmp_path)
     monkeypatch.setattr(
         updates, '_restart_blocker_snapshot',
@@ -1153,11 +1180,62 @@ def test_apply_clear_lock_refuses_when_lock_held(tmp_path, monkeypatch):
     result = updates.apply_clear_lock('webui')
     assert result['ok'] is False
     assert result.get('lock_held') is True
-    assert 'Cannot safely clear the lock' in result['message']
-    assert lock.exists(), "Lock must NOT be removed when held"
-    assert lock.read_text() == 'do-not-touch'
+    assert result.get('manual_command', '').startswith('rm -f')
+    assert result.get('well_known_lock_path') == str(lock)
+    assert 'O_CREAT|O_EXCL' in result['message'], (
+        "message must explain why the server cannot do this automatically"
+    )
+    assert lock.exists(), "Lock must NOT be removed"
+    assert lock.read_text() == 'user-removed-this-by-hand', (
+        "Lock contents must NOT be modified"
+    )
+    assert delete_attempts == [], (
+        "v2.2 contract: apply_clear_lock must never attempt os.remove "
+        "under any circumstances"
+    )
 
 
+def test_apply_clear_lock_listing_includes_other_locks(tmp_path, monkeypatch):
+    """Inventory of other-lock files must round-trip through the response so
+    the operator can act on them too."""
+    (tmp_path / '.git').mkdir()
+    (tmp_path / '.git' / 'index.lock').write_text('')
+    (tmp_path / '.git' / 'refs').mkdir()
+    (tmp_path / '.git' / 'refs' / 'main.lock').write_text('')
+    monkeypatch.setattr(updates, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(
+        updates, '_restart_blocker_snapshot',
+        lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}
+    )
+
+    result = updates.apply_clear_lock('webui')
+    assert result['ok'] is False
+    assert result['lock_held'] is True
+    assert result['other_locks'] == ['refs/main.lock']
+
+
+def test_apply_clear_lock_rejects_unknown_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(updates, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(
+        updates, '_restart_blocker_snapshot',
+        lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}
+    )
+    result = updates.apply_clear_lock('not-a-target')
+    assert result['ok'] is False
+    assert 'Unknown target' in result['message']
+
+
+def test_apply_clear_lock_rejects_not_git_repo(tmp_path, monkeypatch):
+    """If REPO_ROOT has no .git, apply_clear_lock must refuse."""
+    # tmp_path has no .git
+    monkeypatch.setattr(updates, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(
+        updates, '_restart_blocker_snapshot',
+        lambda: {'restart_blocked': False, 'active_streams': 0, 'active_runs': 0}
+    )
+    result = updates.apply_clear_lock('webui')
+    assert result['ok'] is False
+    assert 'Not a git repository' in result['message']
 def test_apply_update_pull_lock_restores_stash(tmp_path, monkeypatch):
     """Greptile P1: a pull-lock error after stashing must restore the stash."""
     (tmp_path / '.git').mkdir()

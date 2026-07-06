@@ -9124,22 +9124,29 @@ async function applyClearUpdateLock(btn){
   window._clearLockInFlight=true;
   btn.disabled=true;
   const originalLabel=btn.textContent;
-  btn.textContent='Clearing lock\u2026';
+  btn.textContent='Checking lock…';
   try{
     const res=await api('/api/updates/clear_lock',{method:'POST',body:JSON.stringify({target}),timeoutMs:60000});
     if(res.ok){
       sessionStorage.removeItem('hermes-update-checked');
       sessionStorage.removeItem('hermes-update-dismissed');
-      showToast('Lock cleared — update applied\u2026');
+      showToast('Update applied — restarting…');
       _waitForServerThenReload({});
+    } else if(res.lock_held){
+      // v2.2: server returns manual-instruction. Show the exact `rm`
+      // command + a one-click "I've removed it, retry update" affordance
+      // that POSTs the same endpoint a second time (now that the user
+      // has presumably removed the lock, the server's success branch
+      // runs the normal non-destructive apply).
+      _renderLockManualInstruction(target, res);
     } else {
-      const msg='Could not clear the lock: '+(res.message||'unknown error');
+      const msg='Could not check the lock: '+(res.message||'unknown error');
       const errEl=$('updateError');
       if(errEl){errEl.textContent=msg;errEl.style.display='block';}
       else showToast(msg);
     }
   }catch(e){
-    const msg='Clear-lock request failed: '+((e&&e.message)||String(e));
+    const msg='Lock-check request failed: '+((e&&e.message)||String(e));
     const errEl=$('updateError');
     if(errEl){errEl.textContent=msg;errEl.style.display='block';}
     else showToast(msg);
@@ -9147,6 +9154,72 @@ async function applyClearUpdateLock(btn){
     window._clearLockInFlight=false;
     btn.disabled=false;
     btn.textContent=originalLabel;
+  }
+}
+function _renderLockManualInstruction(target, res){
+  // Replace the inline `updateError` text with a richer block that shows
+  // the exact manual command and offers a one-click retry button. The
+  // "retry" handler re-invokes `applyClearUpdateLock`; this time, with
+  // the lock gone, the server's success branch runs the normal apply.
+  const cmd = res.manual_command || ('rm -f ' + (res.well_known_lock_path || '.git/index.lock'));
+  const errEl=$('updateError');
+  if(!errEl){
+    showToast('Lock present. Run: '+cmd);
+    return;
+  }
+  errEl.style.display='block';
+  errEl.innerHTML='';
+  const intro=document.createElement('div');
+  intro.style.marginBottom='6px';
+  intro.textContent='A stale .git/index.lock is present. The server cannot remove it safely — please run this command on the host:';
+  errEl.appendChild(intro);
+  const code=document.createElement('pre');
+  code.style.background='rgba(0,0,0,0.05)';
+  code.style.padding='6px';
+  code.style.margin='4px 0';
+  code.style.fontFamily='ui-monospace,monospace';
+  code.style.borderRadius='4px';
+  code.style.whiteSpace='pre-wrap';
+  code.style.wordBreak='break-all';
+  code.textContent=cmd;
+  errEl.appendChild(code);
+  const actions=document.createElement('div');
+  actions.style.display='flex';
+  actions.style.gap='8px';
+  actions.style.flexWrap='wrap';
+  const copyBtn=document.createElement('button');
+  copyBtn.type='button';
+  copyBtn.className='update-btn';
+  copyBtn.textContent='Copy command';
+  copyBtn.onclick=async()=>{
+    try{
+      if(navigator.clipboard&&navigator.clipboard.writeText){
+        await navigator.clipboard.writeText(cmd);
+        copyBtn.textContent='Copied';
+        setTimeout(()=>{ copyBtn.textContent='Copy command'; }, 1500);
+      } else {
+        copyBtn.textContent='Clipboard unavailable';
+      }
+    } catch(_){
+      copyBtn.textContent='Copy failed';
+    }
+  };
+  actions.appendChild(copyBtn);
+  const retryBtn=document.createElement('button');
+  retryBtn.type='button';
+  retryBtn.className='update-btn update-primary';
+  retryBtn.textContent="I've removed the lock — retry update";
+  retryBtn.dataset.target=target;
+  retryBtn.onclick=()=>{ applyClearUpdateLock(retryBtn); };
+  actions.appendChild(retryBtn);
+  errEl.appendChild(actions);
+  if(Array.isArray(res.other_locks)&&res.other_locks.length){
+    const other=document.createElement('div');
+    other.style.marginTop='6px';
+    other.style.fontSize='11px';
+    other.style.opacity='0.85';
+    other.textContent='Other lock files also present: '+res.other_locks.join(', ');
+    errEl.appendChild(other);
   }
 }
 function _normalizeHealthServerIdentity(rawIdentity){
