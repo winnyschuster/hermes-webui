@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Internal
+
+- **Fixed the chronic full-suite test-isolation flakes (8 tests).** A cluster of profile-resolution tests (`test_profile_skills_stats`, `test_scheduled_jobs_profile_isolation`, `test_sprint10` cron-output) passed in isolation but failed in the full suite: a test that simulates "the agent package isn't installed" emptied the real `hermes_cli` package's `__path__` in place, which `monkeypatch` can't undo, so every later `import hermes_cli.profiles` failed for the rest of the run. Added an autouse conftest guard that snapshots the real `hermes_cli` / `hermes_state` packages, their `__path__`, and the agent-path env vars + `sys.path` at session start and restores them after every test, so a "package unavailable" simulation can't poison later tests. Test-only; no product code changes.
+
 ### Fixed
 
 - **Sidebar conversation grouping stays stable across refreshes.** Fork / compaction / delegated-subagent clusters could visibly reshuffle on every sidebar refresh — the same group flipping between "N children" and "N prior turns," message counts and nesting jumping around — because the lineage-report cache was keyed only by the group root and reused stale grouping after the authoritative tip or segment count changed. The cache key now includes the authoritative lineage tip and evicts on a segment-count mismatch, and the backend exposes a stable parent-lineage-tip id so grouping is deterministic across live refreshes. Thanks @rodboev. (#5674, #5598)
