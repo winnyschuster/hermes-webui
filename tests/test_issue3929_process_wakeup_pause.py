@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import queue
+import hashlib
 import sys
 import types
 from unittest import mock
@@ -66,7 +67,11 @@ def _isolate_agent_locks():
 
 @pytest.fixture(autouse=True)
 def _default_live_credential_revalidation(monkeypatch):
-    monkeypatch.setattr(routes, "provider_has_usable_pool_credential", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        routes,
+        "provider_has_process_wakeup_recovery_credential",
+        lambda *_args, **_kwargs: False,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -340,7 +345,7 @@ def test_process_wakeup_pause_revalidates_when_credential_state_changes(tmp_path
     monkeypatch.setattr(routes, "_start_run", _fake_start_run)
     monkeypatch.setattr(
         routes,
-        "provider_has_usable_pool_credential",
+        "provider_has_process_wakeup_recovery_credential",
         lambda provider_id, *, refresh=False: provider_id == "test-provider",
     )
 
@@ -403,7 +408,11 @@ def test_process_wakeup_pause_keeps_changed_credential_state_until_provider_is_u
         lambda *_args, **_kwargs: ("test-model", "test-provider", False),
     )
     monkeypatch.setattr(routes, "_start_run", _unexpected_start_run)
-    monkeypatch.setattr(routes, "provider_has_usable_pool_credential", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        routes,
+        "provider_has_process_wakeup_recovery_credential",
+        lambda *_args, **_kwargs: False,
+    )
 
     response = routes.start_session_turn(
         session.session_id,
@@ -419,9 +428,9 @@ def test_process_wakeup_pause_keeps_changed_credential_state_until_provider_is_u
     assert saved.process_wakeup_pause["credential_state_fingerprint"] == changed_fingerprint
 
 
-def test_process_wakeup_pause_requires_pool_recovery_not_generic_provider_key(tmp_path, monkeypatch):
+def test_process_wakeup_pause_keeps_pause_when_config_key_matches_exhausted_pool_secret(tmp_path, monkeypatch):
     session = Session(
-        session_id="wakeup_pause_generic_key_not_pool_recovery",
+        session_id="wakeup_pause_config_key_matches_exhausted_pool",
         workspace=str(tmp_path),
         model="test-model",
         model_provider="test-provider",
@@ -435,9 +444,24 @@ def test_process_wakeup_pause_requires_pool_recovery_not_generic_provider_key(tm
     assert pause is not None
     session.save()
     models.SESSIONS[session.session_id] = session
+    exhausted_fingerprint = hashlib.sha256(b"same-key").hexdigest()
+    monkeypatch.setattr(providers, "_get_provider_api_key", lambda _provider: "same-key")
+    monkeypatch.setattr(
+        providers,
+        "_pool_entry_payloads",
+        lambda _provider: [{
+            "last_status": "dead",
+            "secret_fingerprint": exhausted_fingerprint,
+        }],
+    )
+    monkeypatch.setattr(
+        routes,
+        "provider_has_process_wakeup_recovery_credential",
+        providers.provider_has_process_wakeup_recovery_credential,
+    )
 
     def _unexpected_start_run(*_args, **_kwargs):
-        raise AssertionError("generic provider credentials must not prove pool-lane recovery")
+        raise AssertionError("same exhausted pool secret must not prove recovery")
 
     monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda _s, _w: str(tmp_path))
     monkeypatch.setattr(routes, "_read_profile_model_config", lambda _s, _p: (None, None, {}))
@@ -447,17 +471,10 @@ def test_process_wakeup_pause_requires_pool_recovery_not_generic_provider_key(tm
         lambda *_args, **_kwargs: ("test-model", "test-provider", False),
     )
     monkeypatch.setattr(routes, "_start_run", _unexpected_start_run)
-    monkeypatch.setattr(
-        routes,
-        "provider_has_usable_credential",
-        lambda *_args, **_kwargs: True,
-        raising=False,
-    )
-    monkeypatch.setattr(routes, "provider_has_usable_pool_credential", lambda *_args, **_kwargs: False)
 
     response = routes.start_session_turn(
         session.session_id,
-        "[IMPORTANT: Background process completed with generic key only.]",
+        "[IMPORTANT: Background process completed with same exhausted config key.]",
         source="process_wakeup",
     )
 
@@ -466,6 +483,73 @@ def test_process_wakeup_pause_requires_pool_recovery_not_generic_provider_key(tm
     saved = Session.load(session.session_id)
     assert saved is not None
     assert saved.process_wakeup_pause["suppressed_count"] == 1
+
+
+def test_process_wakeup_pause_clears_when_config_key_differs_from_exhausted_pool_secret(tmp_path, monkeypatch):
+    session = Session(
+        session_id="wakeup_pause_config_key_differs_from_exhausted_pool",
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+    )
+    pause = models.record_process_wakeup_provider_unavailable_pause(
+        session,
+        classification="credential_pool_empty",
+        model="test-model",
+        provider="test-provider",
+    )
+    assert pause is not None
+    session.save()
+    models.SESSIONS[session.session_id] = session
+    exhausted_fingerprint = hashlib.sha256(b"old-pool-key").hexdigest()
+    monkeypatch.setattr(providers, "_get_provider_api_key", lambda _provider: "new-config-key")
+    monkeypatch.setattr(
+        providers,
+        "_pool_entry_payloads",
+        lambda _provider: [{
+            "last_status": "dead",
+            "secret_fingerprint": exhausted_fingerprint,
+        }],
+    )
+    monkeypatch.setattr(
+        routes,
+        "provider_has_process_wakeup_recovery_credential",
+        providers.provider_has_process_wakeup_recovery_credential,
+    )
+
+    captured = {}
+
+    def _fake_start_run(s, **kwargs):
+        captured["source"] = kwargs.get("source")
+        captured["model"] = kwargs.get("model")
+        captured["model_provider"] = kwargs.get("model_provider")
+        return {"stream_id": "stream-config-key-recovered", "session_id": s.session_id, "_status": 200}
+
+    monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda _s, _w: str(tmp_path))
+    monkeypatch.setattr(routes, "_read_profile_model_config", lambda _s, _p: (None, None, {}))
+    monkeypatch.setattr(
+        routes,
+        "_resolve_compatible_session_model_state",
+        lambda *_args, **_kwargs: ("test-model", "test-provider", False),
+    )
+    monkeypatch.setattr(routes, "_start_run", _fake_start_run)
+
+    response = routes.start_session_turn(
+        session.session_id,
+        "[IMPORTANT: Background process completed with new config key.]",
+        source="process_wakeup",
+    )
+
+    assert response["_status"] == 200
+    assert response["stream_id"] == "stream-config-key-recovered"
+    assert captured == {
+        "source": "process_wakeup",
+        "model": "test-model",
+        "model_provider": "test-provider",
+    }
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert saved.process_wakeup_pause == {}
 
 
 def test_process_wakeup_pause_survives_rotation_style_auth_rewrite(tmp_path, monkeypatch):
@@ -584,8 +668,8 @@ def test_process_wakeup_pause_revalidates_status_recovery_without_fingerprint_ch
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: hermes_home)
     monkeypatch.setattr(
         routes,
-        "provider_has_usable_pool_credential",
-        providers.provider_has_usable_pool_credential,
+        "provider_has_process_wakeup_recovery_credential",
+        providers.provider_has_process_wakeup_recovery_credential,
     )
     session = Session(
         session_id="wakeup_pause_status_recovery",
@@ -666,7 +750,7 @@ def test_process_wakeup_pause_revalidates_at_provider_model_with_canonical_provi
 
     calls = []
 
-    def _provider_has_usable_pool_credential(provider_id, *, refresh=False):
+    def _provider_has_process_wakeup_recovery_credential(provider_id, *, refresh=False):
         calls.append((provider_id, refresh))
         return provider_id == "test-provider"
 
@@ -684,7 +768,11 @@ def test_process_wakeup_pause_revalidates_at_provider_model_with_canonical_provi
         model="@test-provider:test-model",
         provider=None,
     )
-    monkeypatch.setattr(routes, "provider_has_usable_pool_credential", _provider_has_usable_pool_credential)
+    monkeypatch.setattr(
+        routes,
+        "provider_has_process_wakeup_recovery_credential",
+        _provider_has_process_wakeup_recovery_credential,
+    )
     monkeypatch.setattr(routes, "_start_run", _fake_start_run)
 
     response = routes.start_session_turn(
@@ -740,7 +828,7 @@ def test_process_wakeup_pause_revalidation_uses_session_profile_not_default(tmp_
 
     calls = []
 
-    def _provider_has_usable_pool_credential(provider_id, *, refresh=False):
+    def _provider_has_process_wakeup_recovery_credential(provider_id, *, refresh=False):
         active_profile = profiles.get_active_profile_name()
         calls.append((provider_id, refresh, active_profile))
         return active_profile == "default"
@@ -754,7 +842,11 @@ def test_process_wakeup_pause_revalidation_uses_session_profile_not_default(tmp_
         model="test-model",
         provider="test-provider",
     )
-    monkeypatch.setattr(routes, "provider_has_usable_pool_credential", _provider_has_usable_pool_credential)
+    monkeypatch.setattr(
+        routes,
+        "provider_has_process_wakeup_recovery_credential",
+        _provider_has_process_wakeup_recovery_credential,
+    )
     monkeypatch.setattr(routes, "_start_run", _unexpected_start_run)
 
     try:
@@ -1192,7 +1284,11 @@ def test_process_wakeup_pause_empty_provider_lane_probes_after_fingerprint_chang
         model="claude-sonnet-test",
         provider=None,
     )
-    monkeypatch.setattr(routes, "provider_has_usable_pool_credential", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        routes,
+        "provider_has_process_wakeup_recovery_credential",
+        lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setattr(routes, "_start_run", _fake_start_run)
 
     response = routes.start_session_turn(

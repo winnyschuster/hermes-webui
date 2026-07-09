@@ -8919,7 +8919,7 @@ from api.providers import (
     get_providers,
     get_provider_quota,
     get_provider_cost_history,
-    provider_has_usable_pool_credential,
+    provider_has_process_wakeup_recovery_credential,
     set_provider_key,
     remove_provider_key,
 )
@@ -19891,14 +19891,14 @@ def _process_wakeup_revalidation_provider(model, provider) -> str:
     return str(candidate or "").strip()
 
 
-def _process_wakeup_provider_has_usable_pool_credential(
+def _process_wakeup_provider_has_recovery_credential(
     session,
     *,
     model,
     provider,
     provider_id: str | None = None,
 ) -> bool:
-    """Check paused credential-pool lane recovery in the owning session profile."""
+    """Check paused credential-pool recovery in the owning session profile."""
     provider_id = str(
         provider_id or _process_wakeup_revalidation_provider(model, provider) or ""
     ).strip()
@@ -19911,8 +19911,8 @@ def _process_wakeup_provider_has_usable_pool_credential(
             "process_wakeup credential revalidation",
             logger_override=logger,
         ):
-            return provider_has_usable_pool_credential(provider_id, refresh=True)
-    return provider_has_usable_pool_credential(provider_id, refresh=True)
+            return provider_has_process_wakeup_recovery_credential(provider_id, refresh=True)
+    return provider_has_process_wakeup_recovery_credential(provider_id, refresh=True)
 
 
 def _refresh_process_wakeup_pause_credential_fingerprint(session) -> bool:
@@ -20030,7 +20030,7 @@ def start_session_turn(
                 model_provider,
             )
             try:
-                _credential_recovered = _process_wakeup_provider_has_usable_pool_credential(
+                _credential_recovered = _process_wakeup_provider_has_recovery_credential(
                     s,
                     model=model,
                     provider=model_provider,
