@@ -41,6 +41,7 @@ def _resolve_with_catalog(model_id, advertised_ids, *, provider=None, base_url=N
     old_cache = config._available_models_cache
     old_memo = config._advertised_model_ids_memo
     old_fp = config._available_models_cache_source_fingerprint
+    old_prov = config._models_cache_provenance
     if advertised_ids is None:
         config._available_models_cache = None
     else:
@@ -54,12 +55,14 @@ def _resolve_with_catalog(model_id, advertised_ids, *, provider=None, base_url=N
         # the accessor's profile-isolation guard trusts this seeded snapshot.
         config._available_models_cache_source_fingerprint = config._models_cache_source_fingerprint()
     config._advertised_model_ids_memo = None  # force recompute against the seeded snapshot
+    config._sync_models_cache_provenance()  # publish the atomic (snapshot, fingerprint) pair
     try:
         return _resolve_with_config(model_id, provider=provider, base_url=base_url, default=default)
     finally:
         config._available_models_cache = old_cache
         config._advertised_model_ids_memo = old_memo
         config._available_models_cache_source_fingerprint = old_fp
+        config._models_cache_provenance = old_prov
 
 
 # ── OpenRouter prefix handling ────────────────────────────────────────────
@@ -315,9 +318,11 @@ def test_custom_remote_config_declared_full_id_preserved_cold_5979():
     old_cache = config._available_models_cache
     old_memo = config._advertised_model_ids_memo
     old_fp = config._available_models_cache_source_fingerprint
+    old_prov = config._models_cache_provenance
     old_cfg = dict(config.cfg)
     config._available_models_cache = None  # cold
     config._advertised_model_ids_memo = None
+    config._sync_models_cache_provenance()  # publish the cold (None) provenance
     config.cfg['model'] = {
         'provider': 'custom',
         'default': 'x-ai/grok-4.5',  # user-declared full id
@@ -329,6 +334,7 @@ def test_custom_remote_config_declared_full_id_preserved_cold_5979():
         config._available_models_cache = old_cache
         config._advertised_model_ids_memo = old_memo
         config._available_models_cache_source_fingerprint = old_fp
+        config._models_cache_provenance = old_prov
         config.cfg.clear()
         config.cfg.update(old_cfg)
     assert model == 'x-ai/grok-4.5', (
@@ -358,6 +364,7 @@ def test_custom_remote_extra_models_bucket_counts_as_advertised_5979():
     old_cache = config._available_models_cache
     old_memo = config._advertised_model_ids_memo
     old_fp = config._available_models_cache_source_fingerprint
+    old_prov = config._models_cache_provenance
     config._available_models_cache = {
         'groups': [{
             'provider_id': 'custom',
@@ -367,6 +374,7 @@ def test_custom_remote_extra_models_bucket_counts_as_advertised_5979():
     }
     config._available_models_cache_source_fingerprint = config._models_cache_source_fingerprint()
     config._advertised_model_ids_memo = None
+    config._sync_models_cache_provenance()
     try:
         model, _, _ = _resolve_with_config(
             'openai/gpt-5.4', provider='custom', base_url='https://relay.example/v1',
@@ -375,6 +383,7 @@ def test_custom_remote_extra_models_bucket_counts_as_advertised_5979():
         config._available_models_cache = old_cache
         config._advertised_model_ids_memo = old_memo
         config._available_models_cache_source_fingerprint = old_fp
+        config._models_cache_provenance = old_prov
     assert model == 'gpt-5.4', f"bare id in extra_models must count as advertised, got {model!r}"
 
 
@@ -394,11 +403,13 @@ def test_custom_remote_foreign_profile_catalog_ignored_5979():
     old_cache = config._available_models_cache
     old_memo = config._advertised_model_ids_memo
     old_fp = config._available_models_cache_source_fingerprint
+    old_prov = config._models_cache_provenance
     config._available_models_cache = {
         'groups': [{'provider_id': 'custom', 'models': [{'id': 'GLM-5.1', 'label': 'GLM-5.1'}]}]
     }
     config._available_models_cache_source_fingerprint = {'config_yaml': {'path': '/some/other/profile'}}
     config._advertised_model_ids_memo = None
+    config._sync_models_cache_provenance()
     try:
         model, _, _ = _resolve_with_config(
             'zai-org/GLM-5.1', provider='custom', base_url='https://relay.example/v1',
@@ -407,9 +418,56 @@ def test_custom_remote_foreign_profile_catalog_ignored_5979():
         config._available_models_cache = old_cache
         config._advertised_model_ids_memo = old_memo
         config._available_models_cache_source_fingerprint = old_fp
+        config._models_cache_provenance = old_prov
     assert model == 'zai-org/GLM-5.1', (
         f"foreign-profile catalog must be ignored (legacy fallback preserves), got {model!r}"
     )
+
+
+def test_resolver_provenance_read_does_not_block_on_cache_lock_5979():
+    """Regression: the resolver's per-send provenance read must be LOCK-FREE
+    with respect to ``_available_models_cache_lock``.
+
+    Codex found a deadlock in an earlier cut where the accessor acquired that
+    lock: config-save (``_cfg_lock`` → cache lock) opposed catalog-refresh (cache
+    lock → ``_cfg_lock``). The fix publishes an atomic ``(snapshot, fingerprint)``
+    tuple the resolver reads with one lock-free load. Proof: hold the cache lock
+    on one thread while another thread resolves — it must complete promptly, not
+    block behind the held lock.
+    """
+    import threading
+    import time as _time
+    old_cfg = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update({'model': {
+        'provider': 'custom', 'default': 'x-ai/grok-4.5',
+        'base_url': 'https://proxy.example/v1', 'models': {'x-ai/grok-4.5': {}},
+    }})
+    config.invalidate_models_cache()
+    config.get_available_models()  # warm the catalog + publish provenance
+    try:
+        got = config._available_models_cache_lock.acquire(blocking=False)
+        assert got, "precondition: could not take cache lock non-blocking"
+        result = {}
+        def _worker():
+            t0 = _time.time()
+            result['model'] = config.resolve_model_provider(
+                config.model_with_provider_context('x-ai/grok-4.5', 'custom')
+            )[0]
+            result['elapsed'] = _time.time() - t0
+        th = threading.Thread(target=_worker)
+        th.start()
+        th.join(timeout=5)
+        blocked = th.is_alive()
+        config._available_models_cache_lock.release()
+        if blocked:
+            th.join(timeout=5)
+        assert not blocked, "DEADLOCK: resolver blocked on _available_models_cache_lock"
+        assert result.get('model') == 'x-ai/grok-4.5', f"got {result.get('model')!r}"
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+        config.invalidate_models_cache()
 
 
 def test_custom_remote_preserves_unknown_prefix_548():

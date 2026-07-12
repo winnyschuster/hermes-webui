@@ -4620,6 +4620,34 @@ _cache_build_in_progress = False  # True while a cold path is actively building
 # never mutated) and can never serve stale ids from a superseded catalog.
 _advertised_model_ids_memo: tuple | None = None
 
+# Atomic provenance pair: an immutable (snapshot, publisher_fingerprint) tuple
+# published together at every catalog publish/invalidate site via
+# _sync_models_cache_provenance(). The resolver reads THIS single global with one
+# lock-free load so it can never observe a torn snapshot/fingerprint pair (the
+# two underlying globals are assigned as separate statements). Reading a tuple is
+# atomic under the GIL and, crucially, acquires NO lock — so the per-send
+# provenance check introduces no lock-ordering edge (avoids the _cfg_lock ↔
+# _available_models_cache_lock deadlock) and never waits behind a catalog rebuild.
+_models_cache_provenance: tuple | None = None
+
+
+def _sync_models_cache_provenance() -> None:
+    """Republish the atomic (snapshot, fingerprint) provenance pair.
+
+    MUST be called at every site that assigns ``_available_models_cache`` and
+    ``_available_models_cache_source_fingerprint`` (publish and invalidate),
+    AFTER both have been set. It snapshots the current pair into one immutable
+    tuple so ``_endpoint_advertised_model_ids`` reads both consistently with a
+    single lock-free load. A reader that races between an underlying assignment
+    and this call sees the PREVIOUS consistent tuple (never a torn pair); once
+    this runs, readers see the new consistent pair.
+    """
+    global _models_cache_provenance
+    snap = _available_models_cache
+    _models_cache_provenance = (
+        (snap, _available_models_cache_source_fingerprint) if snap is not None else None
+    )
+
 
 def _endpoint_advertised_model_ids(provider_id: str | None) -> frozenset | None:
     """Model ids the given provider's group advertised in the current catalog.
@@ -4640,68 +4668,63 @@ def _endpoint_advertised_model_ids(provider_id: str | None) -> frozenset | None:
     something this custom endpoint advertised.
     """
     global _advertised_model_ids_memo
-    # Read the snapshot AND its source fingerprint together under the catalog
-    # lock so we can never observe a torn pair: publishes assign
-    # _available_models_cache and _available_models_cache_source_fingerprint as
-    # two separate statements (always inside this same lock), so an unlocked
-    # reader could otherwise catch a freshly-published FOREIGN snapshot still
-    # paired with the PREVIOUS profile's (matching) fingerprint and strip against
-    # the wrong catalog. The lock is an RLock and every publish holds it only for
-    # the two assignments — the expensive network rebuild happens BEFORE the
-    # publish block — so this per-send acquisition contends only with the atomic
-    # publish, never with a live provider probe.
-    with _available_models_cache_lock:
-        snapshot = _available_models_cache
-        published_fp = _available_models_cache_source_fingerprint
-        if snapshot is None:
+    # Single lock-free atomic read of the immutable (snapshot, fingerprint) pair
+    # published by _sync_models_cache_provenance(). Reading one tuple can never
+    # tear, and acquiring no lock means this per-send check adds no lock-ordering
+    # edge (no _cfg_lock ↔ _available_models_cache_lock deadlock) and never waits
+    # behind a catalog rebuild.
+    provenance = _models_cache_provenance
+    if provenance is None:
+        return None
+    snapshot, published_fp = provenance
+    if snapshot is None:
+        return None
+    # Profile-isolation fail-safe (profiles are islands): the catalog cache is a
+    # process global, so a concurrently-active profile could have published the
+    # snapshot we're now reading. Only trust it for provenance when the
+    # fingerprint captured AT PUBLISH TIME still matches the current runtime
+    # fingerprint — the ``config_yaml`` axis of that fingerprint is the
+    # PROFILE-SPECIFIC config path (_get_config_path -> get_active_hermes_home),
+    # so a match guarantees the snapshot belongs to the profile asking. Any
+    # mismatch (foreign profile, config edit, stale) returns None so the caller
+    # preserves the id verbatim rather than stripping against another profile's
+    # catalog.
+    try:
+        if published_fp != _models_cache_source_fingerprint():
             return None
-        # Profile-isolation fail-safe (profiles are islands): the catalog cache
-        # is a process global, so a concurrently-active profile could have
-        # published the snapshot we're now reading. Only trust it for provenance
-        # when its published source fingerprint still matches the current runtime
-        # fingerprint — the ``config_yaml`` axis of that fingerprint is the
-        # PROFILE-SPECIFIC config path (_get_config_path -> get_active_hermes_home),
-        # so a match guarantees the snapshot belongs to the profile asking. Any
-        # mismatch (foreign profile, config edit, cold fingerprint) returns None
-        # so the caller preserves the id verbatim rather than stripping against
-        # another profile's catalog.
+    except Exception:
+        return None  # fingerprint unavailable → no trustworthy provenance
+    memo = _advertised_model_ids_memo
+    # Identity check (``is``), not id(): holding the snapshot reference in the
+    # memo keeps it alive, so a freed-then-reused id() can't cause a false hit.
+    if memo is None or memo[0] is not snapshot:
+        by_slug: dict[str, frozenset] = {}
         try:
-            if published_fp != _models_cache_source_fingerprint():
-                return None
-        except Exception:
-            return None  # fingerprint unavailable → no trustworthy provenance
-        memo = _advertised_model_ids_memo
-        # Identity check (``is``), not id(): holding the snapshot reference in the
-        # memo keeps it alive, so a freed-then-reused id() can't cause a false hit.
-        if memo is None or memo[0] is not snapshot:
-            by_slug: dict[str, frozenset] = {}
-            try:
-                groups = snapshot.get("groups", []) or []
-            except AttributeError:
-                return None
-            for group in groups:
-                if not isinstance(group, dict):
-                    continue
-                slug = str(group.get("provider_id") or "").strip().lower()
-                if not slug:
-                    continue
-                # Union BOTH catalog buckets: a provider's models can be split
-                # across ``models`` (visible) and ``extra_models`` (overflow) by
-                # the picker, so an id the endpoint genuinely advertised may live
-                # in either. Only reading ``models`` would miss it and mis-resolve
-                # (e.g. leave the #433 bare id unstripped because it sits in
-                # extra_models).
-                ids = frozenset(
-                    str(m.get("id"))
-                    for bucket in ("models", "extra_models")
-                    for m in (group.get(bucket) or [])
-                    if isinstance(m, dict) and m.get("id")
-                )
-                by_slug[slug] = by_slug.get(slug, frozenset()) | ids
-            memo = (snapshot, by_slug)
-            _advertised_model_ids_memo = memo
-        slug = str(provider_id or "").strip().lower()
-        return memo[1].get(slug)
+            groups = snapshot.get("groups", []) or []
+        except AttributeError:
+            return None
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            slug = str(group.get("provider_id") or "").strip().lower()
+            if not slug:
+                continue
+            # Union BOTH catalog buckets: a provider's models can be split across
+            # ``models`` (visible) and ``extra_models`` (overflow) by the picker,
+            # so an id the endpoint genuinely advertised may live in either. Only
+            # reading ``models`` would miss it and mis-resolve (e.g. leave the
+            # #433 bare id unstripped because it sits in extra_models).
+            ids = frozenset(
+                str(m.get("id"))
+                for bucket in ("models", "extra_models")
+                for m in (group.get(bucket) or [])
+                if isinstance(m, dict) and m.get("id")
+            )
+            by_slug[slug] = by_slug.get(slug, frozenset()) | ids
+        memo = (snapshot, by_slug)
+        _advertised_model_ids_memo = memo
+    slug = str(provider_id or "").strip().lower()
+    return memo[1].get(slug)
 
 
 # Hard wall-clock budget for a COLD live provider-catalog rebuild when it is
@@ -6010,6 +6033,7 @@ def _get_fresh_memory_models_cache(now: float) -> dict | None:
         _available_models_cache_ts = 0.0
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
+        _sync_models_cache_provenance()
         return None
     if _is_valid_models_cache(_available_models_cache):
         return _annotate_fast_tier_model_groups(copy.deepcopy(_available_models_cache))
@@ -6017,6 +6041,7 @@ def _get_fresh_memory_models_cache(now: float) -> dict | None:
     _available_models_cache_ts = 0.0
     _available_models_live_rebuild_ts = 0.0
     _available_models_cache_source_fingerprint = None
+    _sync_models_cache_provenance()
     return None
 
 
@@ -6041,6 +6066,7 @@ def invalidate_models_cache():
         _available_models_cache_ts = 0.0
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
+        _sync_models_cache_provenance()
         _cache_build_in_progress = False
         _cache_build_cv.notify_all()
         # Clear the credential pool cache too (all profiles). Without this,
@@ -6100,6 +6126,7 @@ def invalidate_provider_models_cache(provider_id: str):
         _available_models_cache_ts = 0.0
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
+        _sync_models_cache_provenance()
         _provider_models_invalidated_ts[provider_id] = time.time()
         # Also evict the credential pool so the next cold path re-loads it.
         # Must evict both the original key and its canonical form (load_pool
@@ -7847,6 +7874,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             _available_models_cache_ts = 0.0
             _available_models_live_rebuild_ts = 0.0
             _available_models_cache_source_fingerprint = None
+            _sync_models_cache_provenance()
             disk_groups = None
             stale_disk_groups = None
 
@@ -7897,6 +7925,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             _available_models_cache = disk_groups
             _available_models_cache_ts = now
             _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+            _sync_models_cache_provenance()
             return copy.deepcopy(disk_groups)
 
         # ── prefer_cache: NEVER run the live provider rebuild ────────────────
@@ -7973,6 +8002,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 _available_models_cache_ts = published_at
                 _available_models_live_rebuild_ts = published_at
                 _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                _sync_models_cache_provenance()
             try:
                 _save_models_cache_to_disk(result)
             finally:
@@ -8022,6 +8052,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 _available_models_cache_source_fingerprint = (
                     _models_cache_source_fingerprint()
                 )
+                _sync_models_cache_provenance()
             try:
                 _save_models_cache_to_disk(result)
             except Exception:
@@ -8186,6 +8217,7 @@ def get_available_models_for_session_visit() -> dict:
                 _available_models_cache = copy.deepcopy(disk_cached)
                 _available_models_cache_ts = time.monotonic()
                 _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                _sync_models_cache_provenance()
             _mark("disk_cache_returned")
             _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
             return copy.deepcopy(disk_cached)
