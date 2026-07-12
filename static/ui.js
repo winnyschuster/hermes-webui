@@ -2848,6 +2848,65 @@ function _clearPendingSessionModel(sessionId){
   if(!sid) return;
   try{sessionStorage.removeItem(_pendingSessionModelKey(sid));}catch(_){}
 }
+// #5924: the recovery-send deliberate-pick signal. Returns {model, model_provider}
+// ONLY when the active session's own model is a genuine non-default pick vs the
+// profile default — the same signal send()'s persistent-pick path (_isCrossProviderPick)
+// uses, generalized to same-provider non-default picks too. Used by the recovery
+// paths (cmdRetry / submitEdit) to decide whether to re-arm the single-shot
+// explicit-pick marker: the marker is consumed by the failed send before we reach
+// recovery, so we can't read it back, and comparing _chatPayloadModel() to itself
+// either false-negatives (an already-applied pick looks unchanged) or false-positives
+// (provider inference manufactures a "change"). A non-default session model is the
+// durable, inference-free evidence of a real pick. Returns null (no re-arm → the
+// server's compatible-model resolution runs) when the session is on the default.
+function _deliberateSessionModelPick(sessionId){
+  if(!S.session||S.session.session_id!==sessionId) return null;
+  const model=String(S.session.model||'').trim();
+  if(!model) return null;
+  // Require SESSION-OWNED provider evidence — a stored model_provider on the
+  // session itself. Do NOT infer a provider from the model string: an
+  // unreachable/renamed model like "@removed:mistral-large" with no stored
+  // provider must NOT count as a deliberate pick (round-2/3 false-positive).
+  const provider=S.session.model_provider?String(S.session.model_provider).trim():'';
+  if(!provider) return null;
+  // Require a KNOWN profile default to compare against. If we don't know the
+  // default (empty window._defaultModel), we can't prove this is a non-default
+  // pick, so fail closed → no re-arm (server compatible-model resolution runs).
+  const defaultModel=(typeof window!=='undefined'&&window._defaultModel)?String(window._defaultModel):'';
+  const activeProvider=(typeof window!=='undefined'&&window._activeProvider)?String(window._activeProvider):'';
+  if(!defaultModel||!activeProvider) return null;
+  // Non-default = a different model OR a different provider than the profile
+  // default. A session sitting exactly on the profile default is NOT a pick.
+  const isDefault=(model===defaultModel)&&(provider===activeProvider);
+  if(isDefault) return null;
+  return {model, model_provider:provider};
+}
+// #5924: re-arm the single-shot explicit-pick marker from a recovery pick, but
+// ONLY if it's still safe at fire time. Guards the SILENT same-session race where
+// the user changes the model DURING the recovery's awaits: (1) the session must
+// still be the captured one; (2) the session's CURRENT model/provider must still
+// equal the captured pick (a mid-flight change means the pick is stale — skip);
+// (3) never clobber a NEWER pending marker (an onchange during the await already
+// wrote the authoritative one). Returns true if it re-armed.
+function _reArmRecoveryPick(sessionId, pick){
+  if(!pick||!pick.model) return false;
+  if(!S.session||S.session.session_id!==sessionId) return false;
+  // Current session state must still match the captured pick (no mid-flight change).
+  if(String(S.session.model||'')!==String(pick.model||'')
+     ||String(S.session.model_provider||'')!==String(pick.model_provider||'')) return false;
+  // Do not overwrite a newer marker written by an onchange during the await.
+  if(typeof _readPendingSessionModel==='function'){
+    const existing=_readPendingSessionModel(sessionId);
+    if(existing&&existing.model
+       &&(String(existing.model)!==String(pick.model)
+          ||String(existing.model_provider||'')!==String(pick.model_provider||''))) return false;
+  }
+  if(typeof _rememberPendingSessionModel==='function'){
+    _rememberPendingSessionModel(sessionId, pick.model, pick.model_provider);
+    return true;
+  }
+  return false;
+}
 function _applyPendingSessionModelForSession(sessionId){
   if(!S.session||S.session.session_id!==sessionId) return false;
   const pending=_readPendingSessionModel(sessionId);
@@ -12512,6 +12571,23 @@ function _anchorSceneSceneHasWorklogWorthyRows(scene){
   }
   return false;
 }
+// #5941: an errored/failed turn's terminal_state. A turn that ended in a
+// provider/agent failure but which DID produce assistant content (tool calls,
+// reasoning) still folds that content into a collapsed worklog above the error
+// card — so the user reads a lone error bubble as "nothing came back", even
+// though the real response is one click away. These are the terminal states
+// that must keep the produced content VISIBLE by default. `completed` (normal
+// turn) and null are deliberately excluded, and `cancelled`/`interrupted`
+// (user-initiated stops with their own dedicated cards + #5224 transcript
+// preservation) are left to their existing behavior — this is scoped to the
+// error/failure family the report is about.
+const _ANCHOR_SCENE_ERRORED_TERMINAL_STATES=new Set([
+  'error','no_response','degraded','connection_lost','tool_limit_reached','compression_exhausted',
+]);
+function _anchorSceneHasErroredTerminalState(scene){
+  const state=String(scene&&scene.terminal_state||'').trim().toLowerCase();
+  return _ANCHOR_SCENE_ERRORED_TERMINAL_STATES.has(state);
+}
 function _renderSettledAnchorSceneTransparentForMessage(message, segment, rawIdx){
   if(!message||!message._anchor_activity_scene||!segment) return false;
   if(!_anchorSceneSceneHasWorklogWorthyRows(message._anchor_activity_scene)) return false;
@@ -12637,6 +12713,19 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
   if(streamId&&!_readActivityDisclosureState(activityKey)){
     _copyActivityDisclosureState(`live:${streamId}`, activityKey);
   }
+  // #5941: an errored turn that produced assistant content (tool calls /
+  // reasoning) must not hide that content behind a collapsed header — the user
+  // reads a lone error card as "nothing came back". When the settled scene's
+  // terminal_state is an error/failure (NOT a normal completion) keep the
+  // worklog EXPANDED by default so the produced response stays visible. This
+  // path is only reached for worklog-worthy scenes (the guard at the top
+  // requires >=1 tool/thinking/compression row), so a genuinely-empty errored
+  // turn — a real no_response with zero produced content — never gets here and
+  // still shows only its error card, no phantom empty body. A user who has
+  // explicitly collapsed THIS turn's worklog (saved 'closed' disclosure state)
+  // is still respected, so the default-open never fights an intentional collapse.
+  const erroredWorklogKeepOpen=_anchorSceneHasErroredTerminalState(scene)
+    && _readActivityDisclosureState(activityKey)!=='closed';
   // keepSettledWorklogOpen forces collapsed:false for the ONE height-stable settle
   // render of the just-settled turn (no STREAM_DONE shrink jump) for both pinned
   // followers AND unpinned mid-turn readers. The keep-open is made genuinely
@@ -12648,7 +12737,7 @@ function _renderSettledAnchorSceneForMessage(message, segment, rawIdx){
   // (_isKeepSettledWorklogOpenArmed), so it never persists across restores.
   const group=_anchorSceneWorklogGroup(blocks,{
     live:false,
-    collapsed:!keepSettledWorklogOpen,
+    collapsed:!(keepSettledWorklogOpen||erroredWorklogKeepOpen),
     beforeAnchor:true,
     anchor:segment,
     activityKey,
@@ -17082,6 +17171,11 @@ async function submitEdit(msgIdx, newText) {
   if(!S.session || S.busy) return;
   const initialSid = S.session.session_id;
   const absoluteKeepCount = _oldestIdx + msgIdx;
+  // #5924: capture the deliberate-pick signal up front (pre-network), scoped to
+  // initialSid — a non-default session model (vs profile default), which is
+  // inference-free and survives the failed send's marker consumption. See
+  // _deliberateSessionModelPick. null → no re-arm → server resolution runs.
+  const _recoveryPick=_deliberateSessionModelPick(initialSid);
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
   }
@@ -17091,9 +17185,18 @@ async function submitEdit(msgIdx, newText) {
       session_id: initialSid,
       keep_count: absoluteKeepCount
     })});
+    // #5924 SILENT-race guard: a session switch during the truncate await must not
+    // let this recovery apply session A's intent (truncate/re-arm/send) to the
+    // newly-visible session.
+    if(!S.session || S.session.session_id !== initialSid) return;
     S.messages = S.messages.slice(0, absoluteKeepCount);
     renderMessages();
     $('msg').value = newText;
+    // #5924 (Facet 1 + Facet 4): edit-resubmit is a recovery send. Re-arm the
+    // Re-arm the single-shot explicit-pick marker from the captured non-default
+    // pick — only if still safe at fire time (session unchanged, current model
+    // still matches, no newer onchange marker to clobber). See _reArmRecoveryPick.
+    _reArmRecoveryPick(initialSid, _recoveryPick);
     await send();
   } catch(e) { setStatus(t('edit_failed') + e.message); }
 }
