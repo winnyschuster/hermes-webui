@@ -7903,11 +7903,26 @@ def _run_agent_streaming(
             # owning-session profile across warm + resolve so both see the right
             # profile (no-op for the default/root profile).
             from api import profiles as profiles_api
-            # #5979: whether the user deliberately picked this session's model
-            # (persisted by /api/chat/start). Lets the cold-catalog custom-proxy
-            # branch preserve a deliberate vendor-namespaced pick while still
-            # stripping a stale cross-provider leftover (#433).
-            _explicitly_picked = bool(getattr(s, "model_explicitly_picked", False))
+            # #5979: treat this send as a deliberate pick ONLY when the persisted
+            # explicit-pick signature matches the CURRENT model+provider routing
+            # context. Storing/comparing a signature (not a bare bool) means a
+            # later model/provider change via /api/chat/start, /api/session/update,
+            # normalization, or provider repair automatically invalidates a stale
+            # pick — so a #433 first-party leftover is never wrongly preserved on
+            # a cold catalog. Only affects the cold custom-proxy branch; warm
+            # endpoint-advertised provenance always wins over this flag.
+            from api.models import model_explicit_pick_signature as _mk_sig
+            _picked_sig = getattr(s, "model_explicit_pick_signature", None)
+            # Compare against the session's persisted model+provider — the exact
+            # fields /api/chat/start stamped the signature from (it persists the
+            # resolved model+provider onto the session before dispatch). Falls
+            # back to the worker's model/provider_context if the session fields
+            # are unset. A mismatch (any later model/provider change) yields a
+            # different signature → treated as NOT a deliberate pick.
+            _sig_model = getattr(s, "model", None) or model
+            _sig_provider = getattr(s, "model_provider", None) or provider_context
+            _current_sig = _mk_sig(_sig_model, _sig_provider)
+            _explicitly_picked = bool(_picked_sig) and _picked_sig == _current_sig
             with profiles_api.profile_scope_for_detached_worker(
                 _resolved_profile_name, "model resolution", logger_override=logger
             ):
