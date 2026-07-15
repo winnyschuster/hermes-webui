@@ -34,7 +34,11 @@ from contextlib import closing
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
-from api.agent_runtime import ensure_agent_runtime_current, require_ai_agent_class
+from api.agent_runtime import (
+    AgentRuntimeChangedError,
+    ensure_agent_runtime_current,
+    require_ai_agent_class,
+)
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     _looks_like_default_cli_title,
@@ -21663,6 +21667,22 @@ def _handle_chat_start(handler, body, diag=None):
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        # Reject a stale local Agent runtime before materialising, claiming, or
+        # mutating any session state. Gateway-backed turns run in the gateway's
+        # process and do not depend on this WebUI process's imported checkout.
+        if not webui_gateway_chat_enabled(get_config()):
+            try:
+                ensure_agent_runtime_current()
+            except AgentRuntimeChangedError as exc:
+                return j(
+                    handler,
+                    {
+                        "error": str(exc),
+                        "type": "agent_runtime_stale",
+                        "retryable": True,
+                    },
+                    status=409,
+                )
         diag.stage("get_session") if diag else None
         try:
             s = _get_or_materialize_session(body["session_id"], refresh_cli_messages=True)

@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -99,3 +101,58 @@ else:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_initial_non_git_source_preserves_supported_runtime(monkeypatch):
+    """Non-Git installs cannot be compared, so they preserve existing behavior."""
+    from api import agent_runtime
+
+    monkeypatch.setattr(agent_runtime, "_AGENT_REVISION", None)
+    monkeypatch.setattr(agent_runtime, "_read_agent_revision", lambda _path: None)
+
+    agent_runtime.ensure_agent_runtime_current()
+
+
+def test_known_revision_becoming_unreadable_fails_closed(monkeypatch):
+    """Losing a previously-known revision is indistinguishable from source drift."""
+    from api import agent_runtime
+
+    monkeypatch.setattr(agent_runtime, "_AGENT_REVISION", "known-revision")
+    monkeypatch.setattr(agent_runtime, "_read_agent_revision", lambda _path: None)
+
+    with pytest.raises(agent_runtime.AgentRuntimeChangedError):
+        agent_runtime.ensure_agent_runtime_current()
+
+
+def test_chat_start_rejects_stale_runtime_before_session_materialization(monkeypatch):
+    """A stale local runtime must not claim, create, or mutate session state."""
+    from api import agent_runtime, routes
+
+    monkeypatch.setattr(routes, "webui_gateway_chat_enabled", lambda _cfg: False)
+    monkeypatch.setattr(routes, "get_config", lambda: {})
+
+    def stale():
+        raise agent_runtime.AgentRuntimeChangedError("restart required")
+
+    monkeypatch.setattr(routes, "ensure_agent_runtime_current", stale)
+
+    def must_not_materialize(*_args, **_kwargs):
+        raise AssertionError("session materialized before stale-runtime barrier")
+
+    monkeypatch.setattr(routes, "_get_or_materialize_session", must_not_materialize)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200: {"status": status, "payload": payload},
+    )
+
+    response = routes._handle_chat_start(object(), {"session_id": "session-1"})
+
+    assert response == {
+        "status": 409,
+        "payload": {
+            "error": "restart required",
+            "type": "agent_runtime_stale",
+            "retryable": True,
+        },
+    }
