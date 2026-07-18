@@ -83,8 +83,15 @@ def _stop_proc(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def _write_fake_systemctl(fake_bin: Path, active_state: str, main_pid: int = 0) -> None:
-    """Fake systemctl answering `show -p ActiveState|MainPID --value <unit>`."""
+def _write_fake_systemctl(
+    fake_bin: Path,
+    active_state: str,
+    main_pid: int = 0,
+    environment: str = "",
+    exec_start: str = "",
+) -> None:
+    """Fake systemctl answering `show -p <prop> --value <unit>` for the
+    ActiveState/MainPID/Environment/ExecStart properties the guard inspects."""
     systemctl = fake_bin / "systemctl"
     systemctl.write_text(
         textwrap.dedent(
@@ -94,6 +101,8 @@ def _write_fake_systemctl(fake_bin: Path, active_state: str, main_pid: int = 0) 
               case "${{arg}}" in
                 *ActiveState*) echo "{active_state}"; exit 0 ;;
                 *MainPID*) echo "{main_pid}"; exit 0 ;;
+                *Environment*) echo "{environment}"; exit 0 ;;
+                *ExecStart*) echo "{exec_start}"; exit 0 ;;
               esac
             done
             exit 0
@@ -102,6 +111,32 @@ def _write_fake_systemctl(fake_bin: Path, active_state: str, main_pid: int = 0) 
         encoding="utf-8",
     )
     systemctl.chmod(0o755)
+
+
+def _write_fake_lsof_with_real_and_semantics(fake_bin: Path) -> None:
+    """Fake lsof mimicking real -a semantics: without -a, `-p PID -iTCP:PORT`
+    OR-combines its selectors (matching whenever EITHER hits); with -a they
+    AND. Exit codes come from FAKE_LSOF_OR_EXIT / FAKE_LSOF_AND_EXIT so a test
+    can model 'the pid is alive with sockets, but nothing of it listens on the
+    requested port' — the case a missing -a falsely reports as a conflict."""
+    lsof = fake_bin / "lsof"
+    lsof.write_text(
+        textwrap.dedent(
+            """
+            #!/usr/bin/env bash
+            has_a=0
+            for arg in "$@"; do
+              [[ "${arg}" == "-a" ]] && has_a=1
+            done
+            if [[ "${has_a}" == 1 ]]; then
+              exit "${FAKE_LSOF_AND_EXIT:-1}"
+            fi
+            exit "${FAKE_LSOF_OR_EXIT:-0}"
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    lsof.chmod(0o755)
 
 
 def _write_fake_port_tools(fake_bin: Path, pid_listens: bool) -> None:
@@ -259,6 +294,156 @@ def test_start_allows_alternate_port_while_systemd_unit_auto_restarts(tmp_path):
                 os.kill(started_pid, 9)
             except ProcessLookupError:
                 pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX daemon guards")
+def test_systemd_pid_port_check_requires_and_semantics(tmp_path):
+    """lsof without -a OR-combines -p/-i, so an active unit whose MainPID has
+    sockets but does NOT listen on the requested port must not be mistaken
+    for a conflict (12.07 re-gate finding 2)."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_systemctl(fake_bin, "active", main_pid=4242)
+    _write_fake_lsof_with_real_and_semantics(fake_bin)
+
+    fake_python = tmp_path / "fake-python"
+    fake_log = tmp_path / "fake-python.log"
+    write_fake_python(fake_python)
+
+    port = _free_port()
+    started_pid = None
+    try:
+        result = run_ctl(
+            tmp_path,
+            "start",
+            env=_guard_env(
+                fake_bin,
+                HERMES_WEBUI_PORT=str(port),
+                HERMES_WEBUI_PYTHON=str(fake_python),
+                FAKE_PYTHON_LOG=str(fake_log),
+                FAKE_LSOF_OR_EXIT="0",
+                FAKE_LSOF_AND_EXIT="1",
+            ),
+            timeout=15,
+        )
+        combined = result.stdout + result.stderr
+        assert "Refusing to start" not in combined, combined
+        assert result.returncode == 0, combined
+        pid_file = tmp_path / ".hermes" / "webui.pid"
+        if pid_file.exists():
+            started_pid = int(pid_file.read_text().strip())
+    finally:
+        if started_pid:
+            try:
+                os.kill(started_pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX daemon guards")
+def test_start_on_default_port_allowed_when_unit_configured_elsewhere(tmp_path):
+    """Reverse alternate-port case (12.07 re-gate finding 3): a unit whose
+    CONFIGURED binding is a non-default port must not block a start on 8787
+    just because its ownership cannot be attributed via MainPID."""
+    with socket.socket() as probe:
+        if probe.connect_ex(("127.0.0.1", 8787)) == 0:
+            pytest.skip("default port 8787 already occupied on this host")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_systemctl(
+        fake_bin, "activating", environment="HERMES_WEBUI_PORT=9999"
+    )
+
+    fake_python = tmp_path / "fake-python"
+    fake_log = tmp_path / "fake-python.log"
+    write_fake_python(fake_python)
+
+    started_pid = None
+    try:
+        result = run_ctl(
+            tmp_path,
+            "start",
+            env=_guard_env(
+                fake_bin,
+                HERMES_WEBUI_PORT="8787",
+                HERMES_WEBUI_PYTHON=str(fake_python),
+                FAKE_PYTHON_LOG=str(fake_log),
+            ),
+            timeout=15,
+        )
+        combined = result.stdout + result.stderr
+        assert "Refusing to start" not in combined, combined
+        assert result.returncode == 0, combined
+        pid_file = tmp_path / ".hermes" / "webui.pid"
+        if pid_file.exists():
+            started_pid = int(pid_file.read_text().strip())
+    finally:
+        if started_pid:
+            try:
+                os.kill(started_pid, 9)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX daemon guards")
+def test_start_refuses_when_unit_configured_for_requested_alternate_port(tmp_path):
+    """Counterpart of the reverse case: when the unit's configured binding
+    matches the requested (non-default) port, the conflict must be reported."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    port = _free_port()
+    _write_fake_systemctl(
+        fake_bin, "activating", environment=f"HERMES_WEBUI_PORT={port}"
+    )
+
+    result = run_ctl(
+        tmp_path,
+        "start",
+        env=_guard_env(fake_bin, HERMES_WEBUI_PORT=str(port)),
+        timeout=15,
+    )
+    combined = result.stdout + result.stderr
+    assert "Refusing to start" in combined, combined
+    assert result.returncode != 0, combined
+    assert str(port) in combined
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX daemon guards")
+@pytest.mark.parametrize(
+    ("command", "expected_output"),
+    [
+        ("status", "running (not managed by ctl.sh)"),
+        ("stop", "NOT managed by ctl.sh"),
+    ],
+)
+def test_unmanaged_instance_commands_survive_inherit_errexit(
+    tmp_path, command, expected_output
+):
+    """12.07 re-gate finding 1: with errexit inherited into command
+    substitutions (BASHOPTS=inherit_errexit from the invoking shell), the
+    no-match listener diagnostics must still not abort status/stop."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_port_tools(fake_bin, pid_listens=False)
+    port = _free_port()
+    server = _start_dummy_http_server(port)
+    try:
+        result = run_ctl(
+            tmp_path,
+            command,
+            env=_guard_env(
+                fake_bin,
+                HERMES_WEBUI_PORT=str(port),
+                BASHOPTS="inherit_errexit",
+            ),
+            timeout=15,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert expected_output in combined
+        assert server.poll() is None, "ctl.sh must leave a foreign server untouched"
+    finally:
+        _stop_proc(server)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX daemon guards")

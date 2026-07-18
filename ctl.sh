@@ -385,7 +385,7 @@ _pid_listens_on_port() {
   local pid="$1" port="$2"
   [[ "${pid}" =~ ^[0-9]+$ && "${port}" =~ ^[0-9]+$ ]] || return 2
   if command -v lsof >/dev/null 2>&1; then
-    if lsof -nP -p "${pid}" -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+    if lsof -nP -a -p "${pid}" -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
       return 0   # PID is listening on that port → real conflict
     fi
     return 1     # PID is alive but NOT listening on that port → no conflict
@@ -485,16 +485,38 @@ _port_listener_diag() {
   # Best-effort one-liner describing what listens on TCP port $1. Used in
   # error/status messages only — never fails the caller.
   local port="$1" line=""
+  # The || true keeps the assignments non-failing when errexit is inherited
+  # into command substitutions (shopt inherit_errexit, or a BASHOPTS env from
+  # the invoking shell) — without it a no-match awk/ss aborts status/stop.
   if command -v ss >/dev/null 2>&1; then
-    line="$(ss -tlnp 2>/dev/null | awk -v p="${port}" '$4 ~ (":" p "$") {print; exit}')"
+    line="$(ss -tlnp 2>/dev/null | awk -v p="${port}" '$4 ~ (":" p "$") {print; exit}')" || true
   fi
   if [[ -z "${line}" ]] && command -v lsof >/dev/null 2>&1; then
-    line="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print; exit}')"
+    line="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null | awk 'NR==2 {print; exit}')" || true
   fi
   if [[ -n "${line}" ]]; then
     printf '%s' "${line}"
   fi
   return 0
+}
+
+_systemd_unit_effective_port() {
+  # Best-effort resolution of the port a systemd unit is configured to bind:
+  # HERMES_WEBUI_PORT in its Environment=, then an explicit --port on its
+  # ExecStart=. Prints nothing when the binding cannot be determined so the
+  # caller can fall back to the conservative default-port guard.
+  local scope="$1" unit="$2" env_block="" exec_block="" port=""
+  env_block="$(systemctl "${scope}" show -p Environment --value "${unit}" 2>/dev/null)" || true
+  if [[ "${env_block}" =~ HERMES_WEBUI_PORT=([0-9]+) ]]; then
+    port="${BASH_REMATCH[1]}"
+  fi
+  if [[ -z "${port}" ]]; then
+    exec_block="$(systemctl "${scope}" show -p ExecStart --value "${unit}" 2>/dev/null)" || true
+    if [[ "${exec_block}" =~ --port[=[:space:]]([0-9]+) ]]; then
+      port="${BASH_REMATCH[1]}"
+    fi
+  fi
+  printf '%s' "${port}"
 }
 
 _systemd_webui_conflict() {
@@ -516,7 +538,7 @@ _systemd_webui_conflict() {
   local unit="${HERMES_WEBUI_SYSTEMD_UNIT:-hermes-webui.service}"
   [[ -n "${unit}" ]] || return 1
   local want_port="${CTL_PORT:-${HERMES_WEBUI_PORT:-8787}}"
-  local scope state main_pid
+  local scope state main_pid unit_port
   for scope in --system --user; do
     state="$(systemctl "${scope}" show -p ActiveState --value "${unit}" 2>/dev/null)" || continue
     case "${state}" in
@@ -530,14 +552,29 @@ _systemd_webui_conflict() {
             1) continue ;;   # active on a different port → no conflict
           esac
         fi
-        # Port ownership unknown: guard only the default port (see #3291).
-        if [[ "${want_port}" == "8787" ]]; then
+        # Port ownership unknown via PID: resolve the unit's CONFIGURED
+        # binding and refuse only on actual overlap. Only when the binding
+        # cannot be determined fall back to guarding the default port
+        # (see #3291) so alternate-port instances are never wrongly blocked.
+        unit_port="$(_systemd_unit_effective_port "${scope}" "${unit}")" || true
+        if [[ -n "${unit_port}" ]]; then
+          if [[ "${unit_port}" == "${want_port}" ]]; then
+            printf 'unit %s is active (configured for port %s)' "${unit}" "${unit_port}"
+            return 0
+          fi
+        elif [[ "${want_port}" == "8787" ]]; then
           printf 'unit %s is active' "${unit}"
           return 0
         fi
         ;;
       activating | reloading)
-        if [[ "${want_port}" == "8787" ]]; then
+        unit_port="$(_systemd_unit_effective_port "${scope}" "${unit}")" || true
+        if [[ -n "${unit_port}" ]]; then
+          if [[ "${unit_port}" == "${want_port}" ]]; then
+            printf 'unit %s is %s (auto-restart pending on port %s)' "${unit}" "${state}" "${unit_port}"
+            return 0
+          fi
+        elif [[ "${want_port}" == "8787" ]]; then
           printf 'unit %s is %s (auto-restart pending)' "${unit}" "${state}"
           return 0
         fi
