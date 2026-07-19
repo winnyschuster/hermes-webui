@@ -10,7 +10,6 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
 from typing import Any
 
 from api.config import (

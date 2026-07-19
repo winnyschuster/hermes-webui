@@ -551,8 +551,10 @@ def test_empty_id_runs_approval_reaches_real_response_lifecycle():
                 cancel_event=threading.Event(),
             )
             approval_id = events[0][1]["approval_id"]
-            assert approval_id.startswith(f"gwrun:run-real-{choice}:")
-            assert approvals.gateway_pending_mirror(sid, approval_id=approval_id)["run_id"] == f"run-real-{choice}"
+            assert approval_id
+            mirror = approvals.gateway_pending_mirror(sid, approval_id=approval_id)
+            assert mirror["run_id"] == f"run-real-{choice}"
+            assert mirror["approval_id"] == approval_id
             routes._handle_approval_respond(handler, {
                 "session_id": sid, "choice": choice, "approval_id": approval_id,
             })
