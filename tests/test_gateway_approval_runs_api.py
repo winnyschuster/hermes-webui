@@ -305,7 +305,15 @@ def test_gateway_approval_event_translation():
     assert result["run_id"] == "run-999"
     assert result["approval_id"] == "appr-1"
     empty_id = _gateway_runs_approval_event({**payload, "approval_id": "", "id": ""})
-    assert empty_id["approval_id"] == ""
+    import api.route_approvals as approvals
+    sid = "translation-empty-id"
+    try:
+        approvals.submit_gateway_pending_mirror(sid, empty_id)
+        mirror = approvals.gateway_pending_mirror(sid, run_id="run-999")
+        assert mirror["approval_id"]
+        assert mirror.get("_gateway_agent_identity_v1") is not True
+    finally:
+        approvals._pending.pop(sid, None)
 
     downgraded = _gateway_runs_approval_event({
         "command": "rm -rf /tmp/x",
