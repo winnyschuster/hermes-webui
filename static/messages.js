@@ -6743,10 +6743,12 @@ function autoResize(){
   const _nextValue=String(el.value||'');
   const _isAppendOnly=_nextValue.length>_composerLastResizeValue.length&&_nextValue.startsWith(_composerLastResizeValue);
   const _fitsCurrentHeight=el.scrollHeight<=el.offsetHeight;
-  // Only a direct append that already fits can skip the height round trip.
-  // Replacements (including session and draft restoration) must remeasure so a
-  // previously tall composer can shrink back to its natural height.
-  if(_isAppendOnly&&_fitsCurrentHeight){
+  // Only a direct append at the natural one-row height can skip the height
+  // round trip. Replacements and an already-tall composer must remeasure so the
+  // textarea can shrink back to its natural height.
+  const _minHeight=_isAppendOnly&&_fitsCurrentHeight?parseFloat(getComputedStyle(el).minHeight):NaN;
+  const _isAtMinimumHeight=Number.isFinite(_minHeight)&&el.offsetHeight<=Math.ceil(_minHeight)+1;
+  if(_isAppendOnly&&_fitsCurrentHeight&&_isAtMinimumHeight){
     _composerLastResizeValue=_nextValue;
     updateSendBtn();
     return;

@@ -77,6 +77,7 @@ def test_single_line_growth_does_not_write_height_in_node_fixture():
         };
         const messages = { scrollTop: 0 };
         const $ = (id) => id === 'msg' ? msg : id === 'messages' ? messages : null;
+        const getComputedStyle = () => ({ minHeight: '44px' });
         let sendUpdates = 0;
         function updateSendBtn() { sendUpdates += 1; }
         function _repinMessagesAfterComposerResize() { throw new Error('one-line append must not repin transcript'); }
@@ -129,6 +130,46 @@ def test_session_restore_replaces_tall_composer_with_natural_one_line_height():
     }
 
 
+def test_append_to_an_oversized_composer_remeasures_natural_height():
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    body = _autoresize_body()
+    harness = textwrap.dedent(
+        """
+        let _composerAutoResizeRaf = 0;
+        let _composerLastResizeValue = 'short prefi';
+        let height = 176, writes = 0;
+        const msg = {
+          // The content is an append-only update, but the textarea is still
+          // taller than the content needs. The fast path must not preserve it.
+          value: 'short prefix',
+          get offsetHeight() { return height; },
+          get scrollHeight() { return height > 44 ? height : 44; },
+          style: {
+            set height(value) { writes += 1; height = value === 'auto' ? 44 : parseInt(value, 10); },
+            get height() { return height + 'px'; },
+          },
+        };
+        const messages = { scrollTop: 0 };
+        const $ = (id) => id === 'msg' ? msg : id === 'messages' ? messages : null;
+        const getComputedStyle = () => ({ minHeight: '44px' });
+        function updateSendBtn() {}
+        function _repinMessagesAfterComposerResize() {}
+        %(autoresize)s
+        autoResize();
+        console.log(JSON.stringify({ writes, height, lastValue: _composerLastResizeValue }));
+        """
+    ) % {"autoresize": body}
+    proc = subprocess.run([node, "-e", harness], capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {
+        "writes": 2,
+        "height": 44,
+        "lastValue": "short prefix",
+    }
+
+
 def test_programmatic_one_line_fill_refreshes_primary_button_without_height_writes():
     node = shutil.which("node")
     if not node:  # pragma: no cover
@@ -161,6 +202,7 @@ def test_programmatic_one_line_fill_refreshes_primary_button_without_height_writ
         const messages = { scrollTop: 0 };
         const $ = (id) => id === 'msg' ? msg : id === 'messages' ? messages : id === 'btnSend' ? btn : null;
         const S = { busy: false, pendingFiles: [] };
+        const getComputedStyle = () => ({ minHeight: '44px' });
         const window = { _hasPendingSelections() { return false; } };
         function t(_key) { return _key; }
         function requestAnimationFrame(callback) { callback(); return 1; }
@@ -371,7 +413,9 @@ def test_single_line_growth_skips_the_height_round_trip():
     assert "let _composerLastResizeValue='';" in MESSAGES_JS
     assert "const _isAppendOnly=_nextValue.length>_composerLastResizeValue.length&&_nextValue.startsWith(_composerLastResizeValue);" in body
     assert "const _fitsCurrentHeight=el.scrollHeight<=el.offsetHeight;" in body
-    assert "if(_isAppendOnly&&_fitsCurrentHeight){" in body
+    assert "const _minHeight=_isAppendOnly&&_fitsCurrentHeight?parseFloat(getComputedStyle(el).minHeight):NaN;" in body
+    assert "const _isAtMinimumHeight=Number.isFinite(_minHeight)&&el.offsetHeight<=Math.ceil(_minHeight)+1;" in body
+    assert "if(_isAppendOnly&&_fitsCurrentHeight&&_isAtMinimumHeight){" in body
     assert "el.style.height='auto'" in body
 # ---------------------------------------------------------------------------
 
